@@ -44,37 +44,37 @@ class ConditioningModel(ModelMixin):
     ):
         # Get dimensions
         B, N = x_t.shape[:2]
-        
-        # Initial input is the point locations
+
+        # Initial input is the parameters (human1+human2, etc.)
         x_t_input = [x_t]
         x_t_cond = []
 
-        if self.use_contacts != "NONE":
-            # Add contact map
+        # 1) contact map（只有在明确启用时才加）
+        if self.use_contacts != "NONE" and contact_map is not None:
             contact_map = contact_map.to(x_t.device)
             x_t_input.append(contact_map)
 
-        # Add object class information
-        if self.use_class_conditioning:
-            # Convert object class to one-hot encoding
+        # 2) object / group class one-hot
+        if self.use_class_conditioning and obj_group is not None:
             obj_class_one_hot = F.one_hot(obj_group, num_classes=self.num_classes).float()
             obj_class_one_hot = obj_class_one_hot.reshape(B, self.num_classes)  # B x num_classes
-            # obj_class_one_hot = obj_class_one_hot.expand(-1, N, -1)  # B x N x num_classes
             obj_class_one_hot = obj_class_one_hot.to(x_t.device)
             x_t_cond.append(obj_class_one_hot)
 
-        # Add pointnext encoding for object
-        if self.use_pointnext_conditioning:
+        # 3) PointNeXt embedding
+        if self.use_pointnext_conditioning and obj_pointnext is not None:
             obj_pointnext = obj_pointnext.to(x_t.device)
             x_t_cond.append(obj_pointnext)
 
-         # dropping conditioning for regularization
-        # check train / eval flag
-        x_t_cond = torch.cat(x_t_cond, dim=1)  # (B, D_cond)
-        if self.training and torch.rand(1) < 0.1:
-            x_t_cond = torch.zeros_like(x_t_cond)
-
-        # Concatenate together all the features
-        _input = torch.cat([*x_t_input, x_t_cond], dim=1)  # (B, D)
+        # 4) 拼 conditioning
+        if len(x_t_cond) > 0:
+            x_t_cond = torch.cat(x_t_cond, dim=1)  # (B, D_cond)
+            # dropping conditioning for regularization
+            if self.training and torch.rand(1) < 0.1:
+                x_t_cond = torch.zeros_like(x_t_cond)
+            _input = torch.cat([*x_t_input, x_t_cond], dim=1)
+        else:
+            # 没有任何 conditioning，直接返回原输入
+            _input = torch.cat(x_t_input, dim=1)
 
         return _input

@@ -3,7 +3,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import os
 
-from .datasets import BehaveConfig, GrabConfig, InterCapConfig, OmomoConfig, CustomDatasetConfig
+from .datasets import BehaveConfig, GrabConfig, InterCapConfig, OmomoConfig, CustomDatasetConfig, Embody3DConfig
+
+   # ← 新增
+
 from .model import ConditioningModelConfig, DenoisingModelConfig, TriDiModelConfig
 from .environment import EnvironmentConfig
 
@@ -41,25 +44,21 @@ class DataloaderConfig:
 
 @dataclass
 class TrainConfig:
-    mixed_precision: str = 'no'  # 'no', 'fp16'
+    mixed_precision: str = 'no'
     limit_train_batches: Optional[int] = None
     log_step_freq: int = 20
     checkpoint_freq: int = 50_000
     max_steps: int = 300_000
     print_step_freq: int = 100
     limit_val_batches: Optional[int] = None
-    loss_t_stamp_threshold: int = 250  # threshold for loss computation
+    loss_t_stamp_threshold: int = 250
 
-    # Losses
+    # 新增：H2 形状朝 H1 靠拢的强约束
+    mirror_shape_weight: float = 0.8   # 可以之后调大/调小
     losses: Dict[str, float] = field(default_factory=lambda: {
-        # has to be commented out, otherwise not overwritten
-        # "denoise_1": 10.0,
-        # "denoise_2": 2.0,
-        # "denoise_3": 5.0,
-        # "smpl_v2v": 25.0,
-        # "obj_v2v": 10.0,
-        # "sbj_contacts": 20.0
+        # 原先的内容不动
     })
+
 
 @dataclass
 class OptimizerConfig:
@@ -124,6 +123,8 @@ class ProjectConfig:
     intercap: InterCapConfig = InterCapConfig()
     omomo: OmomoConfig = OmomoConfig()
     custom: CustomDatasetConfig = CustomDatasetConfig()
+    embody3d: Embody3DConfig = Embody3DConfig()
+
 
     model_denoising: DenoisingModelConfig = DenoisingModelConfig()
     model_conditioning: ConditioningModelConfig = ConditioningModelConfig()

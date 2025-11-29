@@ -35,6 +35,7 @@ class Sampler:
         if cfg.sample.dataset == 'random':
             self.dataloaders, self.canonical_obj_meshes, canonical_obj_keypoints\
                 = get_eval_dataloader_random(cfg)
+
         elif cfg.sample.dataset == 'normal':
             self.dataloaders, self.canonical_obj_meshes, canonical_obj_keypoints\
                 = get_eval_dataloader(cfg)
@@ -59,6 +60,8 @@ class Sampler:
         # torch.compile(self.model.denoising_model, mode="reduce-overhead")
         contact_model_type = self.cfg.model_conditioning.use_contacts
         self.contact_model = ContactModel(contact_model_type, device=self.device)
+
+        # === 新：如果关闭 contacts（"NONE"），就不要再去加载权重，也不要用 encode/decode ===
         if len(contact_model_type) > 0 and contact_model_type != "NONE":
             if contact_model_type == "encoder_decimated_clip":
                 weights_path = Path(cfg.env.assets_folder) / f"{cfg.model_conditioning.contact_model}.pth"
@@ -74,15 +77,22 @@ class Sampler:
                     elif self.cfg.sample.contacts_mode == "heatmap":
                         # conditioning on contacts via heatmap
                         enc_dec = "model_enc"
+                    else:
+                        raise ValueError(f"Unsupported contacts mode {self.cfg.sample.contacts_mode}")
                 elif self.cfg.sample.mode[2] == "1":
                     # sampling contacts -> we only need the decoder
                     enc_dec = "model_dec"
                 else:
-                    raise ValueError(f"Unsupported sampling mode {self.cfg.sample.mode} with contacts from {self.cfg.sample.contacts_mode}")
+                    raise ValueError(
+                        f"Unsupported sampling mode {self.cfg.sample.mode} "
+                        f"with contacts from {self.cfg.sample.contacts_mode}"
+                    )
             else:
                 raise ValueError(f"Unsupported contact conditioning {self.cfg.model_conditioning.use_contacts}")
 
             self.contact_model.set_contact_model(contact_model_type, enc_dec, weights_path)
+
+        # 即使是 "NONE"，也把 contact_model 挂到 model 上（里面什么都不做）
         self.model.set_contact_model(self.contact_model)
 
     @torch.no_grad()
@@ -91,7 +101,11 @@ class Sampler:
 
         # condition on contacts
         captions = []
-        if self.cfg.sample.mode[2] == "0": # condition on contacts
+        # === 新：只有在启用 contacts 且 mode[2] == "0" 时才做 contact conditioning ===
+        if (
+            self.cfg.model_conditioning.use_contacts != "NONE"
+            and self.cfg.sample.mode[2] == "0"
+        ):
             gt_sbj_vertices, gt_sbj_joints = self.mesh_model.get_smpl_th(batch)
             batch.sbj_vertices = gt_sbj_vertices
             batch.sbj_joints = gt_sbj_joints
@@ -165,17 +179,21 @@ class Sampler:
                     # Get outputs
                     output, contacts_captions = self.sample_step(batch)
 
-                    # Get contact mask
-                    is_sampling_contacts = self.cfg.sample.mode[2] == "1"
+                    # === 新：如果不用 contacts，直接跳过 mask / 颜色的计算 ===
+                    contacts_mask = None
+                    contacts_full_color = None
+                    if self.cfg.model_conditioning.use_contacts != "NONE":
+                        # Get contact mask
+                        is_sampling_contacts = self.cfg.sample.mode[2] == "1"
 
-                    contacts_mask = self.contact_model.decode_contacts_np(
-                        batch.sbj_contacts_full, output.contacts,
-                        batch.sbj_contact_indexes, is_sampling_contacts
-                    )
-                    B = output.contacts.shape[0]
-                    contacts_full_color = 128 * np.ones((B, 6890, 4), dtype=np.uint8)
-                    contacts_full_color[contacts_mask] = [0, 255, 0, 255]
-                    contacts_full_color[:, :, 3] = 255
+                        contacts_mask = self.contact_model.decode_contacts_np(
+                            batch.sbj_contacts_full, output.contacts,
+                            batch.sbj_contact_indexes, is_sampling_contacts
+                        )
+                        B = output.contacts.shape[0]
+                        contacts_full_color = 128 * np.ones((B, 6890, 4), dtype=np.uint8)
+                        contacts_full_color[contacts_mask] = [0, 255, 0, 255]
+                        contacts_full_color[:, :, 3] = 255
 
                     # Convert output to meshes
                     sbj_meshes, obj_meshes = self.mesh_model.get_meshes(
@@ -302,7 +320,6 @@ class Sampler:
                         # attributes
                         seq_group.attrs['T'] = T
 
-
             # prediction loop
             for batch_idx, batch in enumerate(dataloader):
                 for repetition_id in range(self.cfg.sample.repetitions):
@@ -313,7 +330,6 @@ class Sampler:
                     )
 
                     # convert rotation from 6d to matrix
-                    # output = output
                     sbj_pose = torch.cat([
                         output.sbj_global,
                         output.sbj_pose,

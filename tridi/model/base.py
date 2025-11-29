@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Optional, Tuple
 
 import numpy as np
+import dataclasses
 import torch
 from diffusers import ModelMixin
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -69,10 +70,14 @@ class TriDiModelOutput:
                 return len(attr)
 
 
-def get_custom_betas(beta_start: float, beta_end: float, warmup_frac: float = 0.3, num_train_timesteps: int = 1000):
+def get_custom_betas(
+    beta_start: float,
+    beta_end: float,
+    warmup_frac: float = 0.3,
+    num_train_timesteps: int = 1000
+):
     """Custom beta schedule"""
     betas = np.linspace(beta_start, beta_end, num_train_timesteps, dtype=np.float32)
-    warmup_frac = 0.3
     warmup_time = int(num_train_timesteps * warmup_frac)
     warmup_steps = np.linspace(beta_start, beta_end, warmup_time, dtype=np.float64)
     warmup_time = min(warmup_time, num_train_timesteps)
@@ -107,24 +112,40 @@ class BaseTriDiModel(ModelMixin):
         self.cg_scale = cg_scale
         self.cg_t_stamp = cg_t_stamp
 
-        # Input size
-        # sbj_shape, sbj_global_pose, sbj_pose, sbj_c, obj_pose
+        # ----------------------------------------------------
+        # 输入维度：
+        #  - sbj:  H1 的 (shape + global + pose + transl)
+        #  - obj:  HOI 模式时是 (obj_R + obj_c)
+        #          H2H 模式时是 (h2_shape + h2_global + h2_pose + h2_c)
+        # ----------------------------------------------------
         self.data_sbj_channels = data_sbj_channels
         self.data_obj_channels = data_obj_channels
         self.data_contacts_channels = data_contact_channels
+
         self.data_channels = self.data_sbj_channels + self.data_obj_channels
-        if conditioning_model_config.use_contacts:
+
+        # 只有在真的使用 contacts 时，才加上 contact 通道
+        if getattr(conditioning_model_config, "use_contacts", "") not in ["", "NONE", None]:
             self.data_channels += self.data_contacts_channels
 
         # Output size
         self.out_channels = self.data_channels
 
-        # Create conditioning model
-        self.conditioning_model = ConditioningModel(
-            **OmegaConf.to_container(conditioning_model_config, resolve=True)
-        )
+        # Conditioning model
 
-        # Create denoising model for processing parameters at each diffusion step
+
+        # convert conditioning config to python dict
+        if isinstance(conditioning_model_config, dict):
+            cond_cfg = conditioning_model_config
+        elif dataclasses.is_dataclass(conditioning_model_config):
+            cond_cfg = dataclasses.asdict(conditioning_model_config)
+        else:  # OmegaConf object
+            cond_cfg = OmegaConf.to_container(conditioning_model_config, resolve=True)
+
+        self.conditioning_model = ConditioningModel(**cond_cfg)
+
+
+        # Denoising model
         self.denoising_model = DenoisingModel(
             name=denoising_model_config.name,
             dim_timestep_embed=denoising_model_config.dim_timestep_embed,
@@ -133,28 +154,37 @@ class BaseTriDiModel(ModelMixin):
             dim_cond=self.conditioning_model.cond_channels,
             dim_output=self.out_channels,
             dim_contact=self.data_contacts_channels,
-            # name, dim_timestep_embed, dim_hidden, num_layers
             **denoising_model_config.params
         )
         for layer in self.denoising_model.model.children():
-            if hasattr(layer, 'reset_parameters'):
+            if hasattr(layer, "reset_parameters"):
                 layer.reset_parameters()
 
-        # Create diffusion model schedulers which define the sampling timesteps
+        # Schedulers
         scheduler_kwargs = {}
-        if beta_schedule == 'custom':
-            scheduler_kwargs.update(dict(trained_betas=get_custom_betas(beta_start=beta_start, beta_end=beta_end)))
+        if beta_schedule == "custom":
+            scheduler_kwargs.update(
+                dict(trained_betas=get_custom_betas(beta_start=beta_start, beta_end=beta_end))
+            )
         else:
-            scheduler_kwargs.update(dict(beta_start=beta_start, beta_end=beta_end, beta_schedule=beta_schedule))
+            scheduler_kwargs.update(
+                dict(beta_start=beta_start, beta_end=beta_end, beta_schedule=beta_schedule)
+            )
         scheduler_kwargs.update(dict(prediction_type=self.denoise_mode))
-        self.schedulers_map = {
-            'ddpm': DDPMScheduler(**scheduler_kwargs, clip_sample=False),
-            'ddim': DDIMScheduler(**scheduler_kwargs, clip_sample=False),
-            'pndm': PNDMScheduler(**scheduler_kwargs),
-            'ddpm_guided': DDPMSchedulerGuided(**scheduler_kwargs, clip_sample=False, guidance_scale=cg_scale),
-        }
-        self.scheduler = self.schedulers_map['ddpm']  # this can be changed for inference
 
+        self.schedulers_map = {
+            "ddpm": DDPMScheduler(**scheduler_kwargs, clip_sample=False),
+            "ddim": DDIMScheduler(**scheduler_kwargs, clip_sample=False),
+            "pndm": PNDMScheduler(**scheduler_kwargs),
+            "ddpm_guided": DDPMSchedulerGuided(
+                **scheduler_kwargs, clip_sample=False, guidance_scale=cg_scale
+            ),
+        }
+        self.scheduler = self.schedulers_map["ddpm"]  # inference 时可以切换
+
+    # ======================================================
+    # Conditioning 拼接
+    # ======================================================
     def get_input_with_conditioning(
         self,
         x_t: Tensor,
@@ -165,9 +195,64 @@ class BaseTriDiModel(ModelMixin):
         contact_map: Optional[Tensor] = None,
     ):
         return self.conditioning_model.get_input_with_conditioning(
-            x_t, t=t, t_aux=t_aux, obj_group=obj_group,
-            obj_pointnext=obj_pointnext, contact_map=contact_map,
+            x_t,
+            t=t,
+            t_aux=t_aux,
+            obj_group=obj_group,
+            obj_pointnext=obj_pointnext,
+            contact_map=contact_map,
         )
+
+    # ======================================================
+    # forward 入口：train / sample
+    # ======================================================
+    def forward(
+        self,
+        batch: BatchData,
+        mode: str = "train",
+        sample_type: Optional[Tuple] = None,
+        **kwargs,
+    ):
+        """A wrapper around the forward method for training and inference"""
+        if isinstance(batch, dict):  # multiprocessing 时有时变成 dict
+            batch = BatchData(**batch)
+
+        if mode == "train":
+            sbj, obj = self.merge_input(batch)
+
+            # 这些 conditioning 字段在 Embody3D 里都是 None，要防御性处理
+            obj_pointnext = (
+                batch.obj_pointnext.to(self.device)
+                if getattr(batch, "obj_pointnext", None) is not None
+                else None
+            )
+            obj_class = (
+                batch.obj_class.to(self.device)
+                if getattr(batch, "obj_class", None) is not None
+                else None
+            )
+            obj_group = (
+                batch.obj_group.to(self.device)
+                if getattr(batch, "obj_group", None) is not None
+                else None
+            )
+            contact = getattr(batch, "sbj_contacts", None)
+
+            return self.forward_train(
+                sbj=sbj.to(self.device),
+                obj=obj.to(self.device),
+                obj_class=obj_class,
+                obj_group=obj_group,
+                obj_pointnext=obj_pointnext,
+                contact=contact,
+                **kwargs,
+            )
+
+        elif mode == "sample":
+            return self.forward_sample(sample_type, batch, **kwargs)
+
+        else:
+            raise NotImplementedError(f"Unknown forward mode: {mode}")
 
     def forward_train(self, *args, **kwargs):
         raise NotImplementedError()
@@ -175,56 +260,83 @@ class BaseTriDiModel(ModelMixin):
     def forward_sample(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def forward(self, batch: BatchData, mode='train', sample_type: Optional[Tuple]=None, **kwargs):
-        """A wrapper around the forward method for training and inference"""
-        if isinstance(batch, dict):  # fixes a bug with multiprocessing where batch becomes a dict
-            batch = BatchData(**batch)  # it really makes no sense, I do not understand it
+    # ======================================================
+    # merge_input：把 BatchData 里的字段拼成 sbj / obj 向量
+    # ======================================================
+    @staticmethod
+    def merge_input_sbj(batch: BatchData) -> Tensor:
+        """
+        Subject (Human1) 表示:
+          sbj = [sbj_shape, sbj_global, sbj_pose, sbj_c]
 
-        if mode == 'train':
-            sbj, obj = self.merge_input(batch)
-            obj_pointnext = batch.obj_pointnext.to(self.device) \
-                if batch.obj_pointnext is not None else None
+        你现在的 Embody3D H2H 设置里：
+          sbj_shape: (B, 300)
+          sbj_global: (B, 3)
+          sbj_pose: (B, 153)
+          sbj_c: (B, 3)
+        总维度 = 459，对应 human_pair.yaml 里的 data_sbj_channels: 459
+        """
+        parts = []
+        if batch.sbj_shape is not None:
+            parts.append(batch.sbj_shape)
+        if batch.sbj_global is not None:
+            parts.append(batch.sbj_global)
+        if batch.sbj_pose is not None:
+            parts.append(batch.sbj_pose)
+        if batch.sbj_c is not None:
+            parts.append(batch.sbj_c)
 
-            return self.forward_train(
-                sbj=sbj.to(self.device),
-                obj=obj.to(self.device),
-                obj_class=batch.obj_class.to(self.device),
-                obj_group=batch.obj_group.to(self.device),
-                obj_pointnext=obj_pointnext,
-                contact=batch.sbj_contacts,
-                **kwargs
-            )
-        elif mode == 'sample':
-            return self.forward_sample(
-                sample_type,
-                batch,
-                **kwargs
-            )
-        else:
-            raise NotImplementedError('Unknown forward mode: {}'.format(mode))
+        if len(parts) == 0:
+            raise RuntimeError("merge_input_sbj: all sbj_* fields are None.")
 
-    def merge_input(self, batch):
+        return torch.cat(parts, dim=1)
+
+    @staticmethod
+    def merge_input_obj(batch: BatchData) -> Tensor:
+        """
+        Object / Human2 表示:
+
+        Embody3D-H2H:
+            obj_shape + obj_global + obj_pose + obj_c  → 第二个人(full SMPL-X 参数)
+
+        HOI 模式:
+            obj_R + obj_c
+        """
+
+        # ======== H2H 人类2：obj_* ==========
+        if batch.obj_shape is not None:
+            parts = [batch.obj_shape]
+
+            if batch.obj_global is not None:
+                parts.append(batch.obj_global)
+
+            if batch.obj_pose is not None:
+                parts.append(batch.obj_pose)
+
+            if batch.obj_c is not None:
+                parts.append(batch.obj_c)
+
+            return torch.cat(parts, dim=1)
+
+        # ======== HOI：使用物体的旋转+平移 ==========
+        if batch.obj_R is not None and batch.obj_c is not None:
+            return torch.cat([batch.obj_R, batch.obj_c], dim=1)
+
+        raise RuntimeError(
+            "merge_input_obj: neither obj_shape-based (H2H) nor obj_R-based (HOI) fields are available."
+        )
+
+
+    def merge_input(self, batch: BatchData):
         sbj = self.merge_input_sbj(batch)
         obj = self.merge_input_obj(batch)
-
         return sbj, obj
 
+    # ======================================================
+    # 默认 split_output（HOI 用），H2H 下由 TriDiModel 覆盖
+    # ======================================================
     @staticmethod
-    def merge_input_sbj(batch):
-        # concatenate all pose parameters
-        sbj_pose = torch.cat([batch.sbj_global, batch.sbj_pose, batch.sbj_c], dim=1)
-        # obtain joint sbj representation
-        sbj = torch.cat([batch.sbj_shape, sbj_pose], dim=1)
-        return sbj
-
-    @staticmethod
-    def merge_input_obj(batch):
-        # obtain joint object representation
-        obj = torch.cat([batch.obj_R, batch.obj_c], dim=1)
-        return obj
-
-    @staticmethod
-    def split_output(output):
+    def split_output(output: Tensor) -> TriDiModelOutput:
         return TriDiModelOutput(
             sbj_shape=output[:, :10],
             sbj_global=output[:, 10:16],
@@ -235,7 +347,9 @@ class BaseTriDiModel(ModelMixin):
         )
 
     def set_mesh_model(self, mesh_model):
+        # H2H 目前不用 mesh_model，可以在具体 TriDiModel 里实现
         pass
 
     def set_contact_model(self, contact_model):
+        # H2H 目前不用 contact_model，可以在具体 TriDiModel 里实现
         pass

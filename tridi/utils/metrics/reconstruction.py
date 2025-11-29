@@ -6,7 +6,9 @@ import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
 from tqdm.autonotebook import tqdm
+import logging  # <-- 新增
 
+logger = logging.getLogger(__name__)  # <-- 新增
 from config.config import ProjectConfig
 from tridi.model.nn.common import get_hdf5_files_for_nn, get_sequences_for_nn
 
@@ -157,10 +159,25 @@ def get_sbj_metrics(
         for sequence in tqdm(test_sequences[dataset], ncols=80, leave=False):
             sbj, obj, act = sequence
 
-            test_sequence = test_hdf5_dataset[sbj][f"{obj}_{act}"]
-            sampled_sequence = samples_hdf5_dataset[sbj][f"{obj}_{act}"]
-            T = test_sequence.attrs["T"]
+            # 这里加 try/except，测试 HDF5 里缺的序列就跳过
+            try:
+                test_sequence = test_hdf5_dataset[sbj][f"{obj}_{act}"]
+            except KeyError:
+                logger.warning(
+                    f"Sequence missing in H5 dataset for reconstruction (sbj), skip: {sbj}/{obj}_{act}"
+                )
+                continue
 
+            # 样本 HDF5 里如果也缺，依然跳过
+            try:
+                sampled_sequence = samples_hdf5_dataset[sbj][f"{obj}_{act}"]
+            except KeyError:
+                logger.warning(
+                    f"Sequence missing in samples H5 for reconstruction (sbj), skip: {sbj}/{obj}_{act}"
+                )
+                continue
+
+            T = test_sequence.attrs["T"]
             T_stamps = list(range(T))
             mask = np.ones(T, dtype=bool)
 
@@ -195,6 +212,7 @@ def get_sbj_metrics(
     sbj_contact_diffused = np.concatenate(sbj_contact_diffused, 0) if len(sbj_contact_diffused) > 0 else [0]
 
     return mpjpe_results, mpjpe_pa_results, sbj_contact_mesh, sbj_contact_diffused
+
 
 
 @torch.no_grad()
@@ -327,8 +345,23 @@ def get_obj_metrics(
         for sequence in tqdm(test_sequences[dataset], ncols=80, leave=False):
             sbj, obj, act = sequence
 
-            test_sequence = test_hdf5_dataset[sbj][f"{obj}_{act}"]
-            sampled_sequence = samples_hdf5_dataset[sbj][f"{obj}_{act}"]
+            # 同样这里加 try/except
+            try:
+                test_sequence = test_hdf5_dataset[sbj][f"{obj}_{act}"]
+            except KeyError:
+                logger.warning(
+                    f"Sequence missing in H5 dataset for reconstruction (obj), skip: {sbj}/{obj}_{act}"
+                )
+                continue
+
+            try:
+                sampled_sequence = samples_hdf5_dataset[sbj][f"{obj}_{act}"]
+            except KeyError:
+                logger.warning(
+                    f"Sequence missing in samples H5 for reconstruction (obj), skip: {sbj}/{obj}_{act}"
+                )
+                continue
+
             T = test_sequence.attrs["T"]
             T_stamps = list(range(T))
             mask = np.ones(T, dtype=bool)
@@ -339,7 +372,6 @@ def get_obj_metrics(
             obj_f = np.asarray(sampled_sequence["obj_f"], dtype=np.int32)
             sbj_v = np.asarray(sampled_sequence["sbj_v"], dtype=np.float32)[mask]
             sbj_f = np.asarray(sampled_sequence["sbj_f"], dtype=np.int32)
-
 
             obj_v2v.append(get_obj_v2v(sampled_obj_v, test_obj_v).flatten())
             obj_center_distance.append(get_obj_center_distance(sampled_obj_v, test_obj_v).flatten())
@@ -357,6 +389,7 @@ def get_obj_metrics(
                 diffused_contact_mask = diffused_contact_mask[:, sbj_contact_indexes]
                 similarity_mask = gt_contacts_mask == diffused_contact_mask  # T x 6890
                 obj_contact_diffused.append(similarity_mask.mean(1))  # T
+
     obj_v2v = np.concatenate(obj_v2v, 0)
     obj_center_distance = np.concatenate(obj_center_distance, 0)
     obj_contact_mesh = np.concatenate(obj_contact_mesh, 0) if len(obj_contact_mesh) > 0 else [0]

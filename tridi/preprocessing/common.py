@@ -284,15 +284,23 @@ class DatasetSample:
 
 
 def contacts_worker(obj_mesh, obj_verts, sbj_verts, sbj_faces, contact_threshold):
+    # 更新物体 mesh 顶点
     obj_mesh.vertices = obj_verts
 
+    # 在物体表面采样点
     obj_points = obj_mesh.sample(8000)
-    obj2sbj_d, _, _ = igl.signed_distance(obj_points, sbj_verts, sbj_faces, return_normals=False)
 
-    if np.any(obj2sbj_d < contact_threshold):
-        return True
-    else:
-        return False
+    # libigl 需要普通的 numpy 数组，并且 dtype 要对
+    P = np.asarray(obj_points, dtype=np.float64)      # 采样点 (N, 3)
+    V = np.asarray(sbj_verts, dtype=np.float64)       # 人体顶点 (V, 3)
+    F = np.asarray(sbj_faces, dtype=np.int64)         # 人体三角面 (F, 3)
+
+    # 新版 API：返回 4 个数组 (d, i, c, n)，这里只关心距离 d
+    obj2sbj_d, _, _, _ = igl.signed_distance(P, V, F)
+
+    # 只要有任意点到人体表面距离小于 contact_threshold 就认为这一帧有接触
+    return np.any(obj2sbj_d < contact_threshold)
+
 
 
 def preprocess_worker(

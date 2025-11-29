@@ -28,7 +28,8 @@ class DenoisingModelConfig:
 class TriDiModelConfig:
     # Input configuration
     data_sbj_channels: int = 10 + 52 * 6 + 3
-    data_obj_channels: int = 3 + 6
+    data_obj_channels: int = 10 + 52 * 6 + 3
+    #data_obj_channels: int = 3 + 6
     data_contact_channels: int = 128  # 256 for surface, 24 for parts
 
     # diffusion

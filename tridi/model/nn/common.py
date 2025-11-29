@@ -7,6 +7,10 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
+import logging   # <-- 新增
+logger = logging.getLogger(__name__)  # <-- 新增
+
+
 
 
 def pseudo_inverse(mat):
@@ -256,14 +260,20 @@ def get_features_for_class_specific_nn(
                 defaultdict(list), defaultdict(list), defaultdict(list)
         with h5py.File(hdf5_files[dataset_name], "r") as hdf5_dataset:
             for sequence in tqdm(sequences_list, ncols=80, leave=False):
-                _features, class_id, _labels = get_data_for_sequence(
-                    knn, sequence, dataset_name, hdf5_dataset, objname2classid
-                )
+                sbj, obj, act = sequence
+                try:
+                    _features, class_id, _labels = get_data_for_sequence(
+                        knn, sequence, dataset_name, hdf5_dataset, objname2classid
+                    )
+                except KeyError:
+                    logger.warning(
+                        f"Sequence missing in H5 dataset for eval (class-specific), skip: {sbj}/{obj}_{act}"
+                    )
+                    continue
 
                 if len(_features) == 0:
                     continue
 
-                sbj, obj, act = sequence
                 _t_stamps = [f"{sbj}/{obj}/{act}/t{t_stamp:05d}" for t_stamp in range(len(_labels))]
                 if is_train:
                     features[class_id].append(_features)
@@ -276,17 +286,20 @@ def get_features_for_class_specific_nn(
 
     for class_id in set(objname2classid.values()):
         if is_train:
+            if len(features[class_id]) == 0:
+                continue
             features[class_id] = np.concatenate(features[class_id], axis=0)
             labels[class_id] = np.concatenate(labels[class_id], axis=0)
             t_stamps[class_id] = t_stamps[class_id]
         else:
             for dataset_name in sequences.keys():
-                if class_id in list(features[dataset_name].keys()):
+                if class_id in list(features[dataset_name].keys()) and len(features[dataset_name][class_id]) > 0:
                     features[dataset_name][class_id] = np.concatenate(features[dataset_name][class_id], axis=0)
                     labels[dataset_name][class_id] = np.concatenate(labels[dataset_name][class_id], axis=0)
                     t_stamps[dataset_name][class_id] = t_stamps[dataset_name][class_id]
 
     return features, labels, t_stamps
+
 
 
 def get_features_for_nn(
@@ -305,14 +318,21 @@ def get_features_for_nn(
     for dataset_name, sequences_list in sequences.items():
         with h5py.File(hdf5_files[dataset_name], "r") as hdf5_dataset:
             for sequence in tqdm(sequences_list, ncols=80, leave=False):
-                _features, _, _labels = get_data_for_sequence(
-                    knn, sequence, dataset_name, hdf5_dataset, objname2classid
-                )
+                sbj, obj, act = sequence
+                try:
+                    _features, _, _labels = get_data_for_sequence(
+                        knn, sequence, dataset_name, hdf5_dataset, objname2classid
+                    )
+                except KeyError:
+                    # 某些序列在 HDF5 里不存在（比如 basketball_Date03），直接跳过
+                    logger.warning(
+                        f"Sequence missing in H5 dataset for eval, skip: {sbj}/{obj}_{act}"
+                    )
+                    continue
 
                 if len(_features) == 0:
                     continue
 
-                sbj, obj, act = sequence
                 _t_stamps = [f"{sbj}/{obj}/{act}/t{t_stamp:05d}" for t_stamp in range(len(_labels))]
                 if is_train:
                     features.append(_features)
@@ -330,8 +350,12 @@ def get_features_for_nn(
         # t_stamps = t_stamps
     else:
         for dataset_name in sequences.keys():
+            if len(features[dataset_name]) == 0:
+                # 万一某个 dataset 没有任何有效序列，就跳过 concat，后面用到再说
+                continue
             features[dataset_name] = np.concatenate(features[dataset_name], axis=0)
             labels[dataset_name] = np.concatenate(labels[dataset_name], axis=0)
             # t_stamps[dataset_name] = t_stamps[dataset_name]
 
     return features, labels, t_stamps
+

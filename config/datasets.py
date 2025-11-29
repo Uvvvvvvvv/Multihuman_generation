@@ -172,3 +172,55 @@ class CustomDatasetConfig(DatasetConfig):
     test_actions: Optional[List[str]] = None
     test_split_file: Optional[str] = os.path.join("${env.assets_folder}", "custom_test.json")
 # ============================================================
+@dataclass
+class Embody3DConfig(DatasetConfig):
+    name: str = "embody3d"
+    root: str = "/media/uv/Data/workspace/tridi/embody-3d/datasets"
+
+    objects: List[str] = field(default_factory=lambda: [
+        # Embody3D 本身没有 object，这里保持空即可
+    ])
+    obj2groupid: Dict[str, int] = field(default_factory=lambda: {})
+    obj2classid: Dict[str, int] = field(default_factory=lambda: {})
+
+    # subjects = 目录名（如 daylife, acting, locomotion…）
+    train_subjects: Optional[List[str]] = None
+    train_actions: Optional[List[str]] = None
+    train_split_file: Optional[str] = None
+
+    test_subjects: Optional[List[str]] = None
+    test_actions: Optional[List[str]] = None
+    test_split_file: Optional[str] = None
+
+    downsample_factor: int = 1
+    fps_train: int = 30
+    fps_eval: int = 30
+    augment_rotation: bool = False
+    augment_symmetry: bool = False
+
+# ============================================================
+# Register HumanPairDataset
+# ============================================================
+from tridi.data.human_pair_dataset import HumanPairDataset
+
+def get_human_pair_dataset(cfg, split):
+    """
+    cfg: ProjectConfig
+    split: 'train' or 'test'
+    Embody-3D 数据不区分 train/test，我们直接全部加载
+    """
+    root = "/media/uv/Data/workspace/tridi/embody-3d/datasets"
+
+    return HumanPairDataset(root_dir=root)
+
+
+# DATASETS 字典（TriDi 主 loader 会从这里查找）
+DATASETS = {
+    "behave": BehaveConfig,
+    "grab": GrabConfig,
+    "intercap": InterCapConfig,
+    "omomo": OmomoConfig,
+    "custom": CustomDatasetConfig,
+    "human_pair": get_human_pair_dataset,   # ⭐⭐ 新增 ⭐⭐
+}
+

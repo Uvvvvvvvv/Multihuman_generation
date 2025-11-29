@@ -108,12 +108,26 @@ def preprocess(cfg):
         T = len(t_stamps)
 
         # keep only overlapping t_stamps
+                # keep only overlapping t_stamps
+        # 注意：smpl_params / obj_params 里面有一些是标量（0 维），比如元信息，
+        # 这样的就不能按时间索引，直接跳过即可
         for k, v in smpl_params.items():
-            if k != "save_name":
-                smpl_params[k] = v[smpl_indices]
+            if k == "save_name":
+                continue
+            v = np.asarray(v)
+            if v.ndim == 0:
+                # 标量（比如字符串索引、性别之类的 meta），不按时间切
+                continue
+            smpl_params[k] = v[smpl_indices]
+
         for k, v in obj_params.items():
-            if k != "save_name":
-                obj_params[k] = v[obj_indices]
+            if k == "save_name":
+                continue
+            v = np.asarray(v)
+            if v.ndim == 0:
+                continue
+            obj_params[k] = v[obj_indices]
+
         # ===========================================
 
         # ============ 2 extract vertices for subject

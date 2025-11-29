@@ -279,18 +279,34 @@ class HOIDataset:
 
     def get_sbj2sct(self):
         # used to create hdf5 file for sampling
+        from collections import defaultdict
         sbj2sct = defaultdict(list)
+        missing = 0
 
         for sbj, obj_acts in self.sbj2objact.items():
             for (obj, act) in obj_acts:
-                seq = self.get_sequence(sbj, obj, act)
+                # 有些 sequence 在预处理时被彻底过滤掉了（比如没有接触帧），
+                # HDF5 里就不存在，需要跳过
+                try:
+                    seq = self.get_sequence(sbj, obj, act)
+                except KeyError:
+                    logger.warning(
+                        "Sequence missing in H5 dataset when building sbj2sct, skip: %s/%s_%s",
+                        sbj, obj, act
+                    )
+                    missing += 1
+                    continue
+
                 if self.preload_data:
                     T = seq["_attrs"]["T"]
                 else:
                     T = seq.attrs["T"]
 
                 sbj2sct[sbj].append((f"{obj}_{act}", self.obj2classid[obj], T))
+
+        logger.info(f"get_sbj2sct: skipped {missing} missing sequences.")
         return sbj2sct
+
 
     def _get_sbj2objact_from_split(self) -> Dict[str, List[str]]:
         with open(self.split_file, "r") as fp:
@@ -334,7 +350,16 @@ class HOIDataset:
         T = 0
         for sbj, obj_acts in self.sbj2objact.items():
             for (obj, act) in obj_acts:
-                seq = self.get_sequence(sbj, obj, act)
+                # 有些序列在预处理时因为没有 contact 被跳过了，
+                # 这里如果 HDF5 里不存在就直接忽略
+                try:
+                    seq = self.get_sequence(sbj, obj, act)
+                except KeyError:
+                    logger.warning(
+                        f"Sequence missing in H5 dataset, skip: {sbj}/{obj}_{act}"
+                    )
+                    continue
+
                 if self.preload_data:
                     t_stamps = list(range(seq["_attrs"]["T"]))
                 else:
@@ -361,6 +386,7 @@ class HOIDataset:
                 data.extend(seq_data)
         logger.info(f"HOI dataset {self.name} {self.split} has {T} frames.")
         return data
+
 
     def _sort_data(self) -> None:
         self.data = sorted(
@@ -391,7 +417,20 @@ class HOIDataset:
     def _load_canonical_keypoints(self) -> Dict[int, Dict[str, np.ndarray]]:
         canonical_obj_keypoints = dict()
         for class_id, object_name in self.classid2obj.items():
-            canonical_obj_keypoints[class_id] = dict(np.load(
-                str(self.root / "object_keypoints" / f"{object_name}.npz")
-            ))
+            kp_path = self.root / "object_keypoints" / f"{object_name}.npz"
+            kp_dict = dict(np.load(str(kp_path)))  # 里面一般有 cartesian, barycentric, triangles_ids
+
+            # 一些预处理脚本不会保存法向，但 MeshModel 需要这个 key，
+            # 这里如果没有，就用全零占位，形状和 cartesian 一样 (N, 3)
+            if "normals" not in kp_dict:
+                cart = kp_dict.get("cartesian", None)
+                if cart is not None:
+                    kp_dict["normals"] = np.zeros_like(cart)
+                else:
+                    # 极端情况：连 cartesian 都没有，就直接给一个空数组
+                    kp_dict["normals"] = np.zeros((0, 3), dtype=np.float32)
+
+            canonical_obj_keypoints[class_id] = kp_dict
+
         return canonical_obj_keypoints
+

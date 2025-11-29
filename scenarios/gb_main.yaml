@@ -167,7 +167,8 @@ model_conditioning:
   contact_model: "gb_contacts"
 model:
   data_sbj_channels: 325
-  data_obj_channels: 9
+  data_obj_channels: 325 #HHI
+  #data_obj_channels: 9
   data_contact_channels: 128
   denoise_mode: sample
   beta_start: 1.0e-05

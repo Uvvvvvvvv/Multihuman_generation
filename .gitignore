@@ -4,14 +4,15 @@
 experiments/
 visualization/
 .ipynb_checkpoints
-# 忽略特定的文件夹 (后面加斜杠表示这是一个目录)
+
 embody-3d/
 GRAB/
-data/
+data/*
+!data/*.py
 samples/
 smplx/
 
-# 这里的 # 号代表注释，Git 不会读取
+
 *.ply
 *.png
 *.jpg

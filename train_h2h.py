@@ -39,9 +39,6 @@ def load_config():
 
 
 def build_model(cfg, device):
-    """
-    根据 cfg 构建 TriDiModel。
-    """
     denoise_cfg = DenoisingModelConfig(
         name=cfg.model_denoising.name,
         dim_timestep_embed=cfg.model_denoising.dim_timestep_embed,
@@ -62,18 +59,19 @@ def build_model(cfg, device):
         denoising_model_config=denoise_cfg,
         conditioning_model_config=cond_cfg,
     )
-
     model.to(device)
 
-    # 关键补丁：保证 sparse_timesteps 和时间步索引在同一设备上
-    if hasattr(model, "sparse_timesteps") and isinstance(model.sparse_timesteps, torch.Tensor):
-        model.sparse_timesteps = model.sparse_timesteps.to(device)
+    # 保证 scheduler 在同一个 device
+    if hasattr(model, "scheduler"):
+        if hasattr(model.scheduler, "alphas_cumprod"):
+            model.scheduler.alphas_cumprod = model.scheduler.alphas_cumprod.to(device)
 
     logger.info(f"Model built. Using device: {device}")
     logger.info(
         f"#params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M"
     )
     return model
+
 
 
 def build_optimizer(cfg, model):
@@ -94,10 +92,7 @@ def main():
     cfg = load_config()
 
     # ------------ 设备选择 ------------
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     # ------------ DataLoader ------------
@@ -113,6 +108,10 @@ def main():
     model = build_model(cfg, device)
     optimizer = build_optimizer(cfg, model)
 
+    # 用标准 DDPM scheduler 做训练
+    scheduler_ddpm = model.schedulers_map["ddpm"]
+    T = scheduler_ddpm.config.num_train_timesteps
+
     max_steps = cfg.train.max_steps
     log_step_freq = cfg.train.log_step_freq
     print_step_freq = cfg.train.print_step_freq
@@ -120,7 +119,7 @@ def main():
 
     train_iter = iter(train_loader)
 
-    logger.info("Start training ...")
+    logger.info("Start training H2H (epsilon prediction on H2 only) ...")
     global_step = 0
     t_start = time.time()
 
@@ -140,44 +139,69 @@ def main():
 
         batch = batch.to(device)
 
-        # ------- 前向：显式调用 forward_train，拿到 aux_output -------
-        # 把 BatchData 打平成 sbj / obj 向量 (B, 459)
-        sbj_vec = model.merge_input_sbj(batch).to(device)
-        obj_vec = model.merge_input_obj(batch).to(device)
+        # 展开成向量 (B, 459)
+        sbj_vec = model.merge_input_sbj(batch).to(device)  # H1
+        obj_vec = model.merge_input_obj(batch).to(device)  # H2 (target)
 
-        denoise_loss_dict, aux_output = model.forward_train(
-            sbj=sbj_vec,
-            obj=obj_vec,
-            contact=None,
-            obj_class=None,
+        B = sbj_vec.shape[0]
+
+        # ------- 采时间步 & 噪声，只对 H2 加噪 -------
+        t_obj = torch.randint(
+            low=0,
+            high=T,
+            size=(B,),
+            device=device,
+            dtype=torch.long,
+        )
+        eps_obj = torch.randn_like(obj_vec)
+
+        # q(x_t | x_0, eps)
+        obj_t = scheduler_ddpm.add_noise(obj_vec, eps_obj, t_obj)
+
+        # contact 通道是 0 维，这里只是保持接口统一
+        if model.data_contacts_channels > 0:
+            contact_t = torch.zeros(
+                B, model.data_contacts_channels, device=device, dtype=sbj_vec.dtype
+            )
+        else:
+            contact_t = torch.zeros(B, 0, device=device, dtype=sbj_vec.dtype)
+
+        # 拼成 (H1_clean, H2_noisy)
+        x_t = torch.cat([sbj_vec, obj_t], dim=1)
+
+        # ------- Conditioning 拼接 -------
+        # H1 作为 condition，t_sbj=0，t_obj=t_obj
+        x_t_input = model.get_input_with_conditioning(
+            x_t,
             obj_group=None,
+            contact_map=contact_t,
+            t=torch.zeros_like(t_obj),   # H1 时间步 0
+            t_aux=t_obj,                 # H2 时间步
             obj_pointnext=None,
-            return_intermediate_steps=True,
         )
 
-        # aux_output: (x_0, x_t, noise, x_0_pred, t_sbj, t_obj, t_contact)
-        x_0, x_t, noise, x_0_pred, t_sbj, t_obj, t_contact = aux_output
+        # ------- 噪声预测 -------
+        with torch.no_grad():
+            t_sbj = torch.zeros_like(t_obj)
+            t_contact = torch.zeros_like(t_obj)
+
+        eps_pred_full = model.denoising_model(
+            x_t_input,
+            t=t_sbj,
+            t_obj=t_obj,
+            t_contact=t_contact,
+        )
 
         D_sbj = model.data_sbj_channels
         D_obj = model.data_obj_channels
 
-        x0_pred_sbj = x_0_pred[:, :D_sbj]
-        x0_pred_obj = x_0_pred[:, D_sbj:D_sbj + D_obj]
+        # 把预测拆成 H1 / H2 对应的噪声
+        eps_pred_obj = eps_pred_full[:, D_sbj : D_sbj + D_obj]
 
-        # --------- 形状 mirroring loss：强迫 H2 的 betas 像 H1 ---------
-        # 每个 459: [0:300]=betas, [300:303]=global_orient, [303:456]=pose, [456:459]=trans
-        betas_sbj = x0_pred_sbj[:, :300]
-        betas_obj = x0_pred_obj[:, :300]
-        loss_shape_mirror = F.mse_loss(betas_obj, betas_sbj)
+        # ------- 标准 DDPM 噪声预测 loss -------
+        loss_denoise = F.mse_loss(eps_pred_obj, eps_obj)
 
-        # ------- 原来的 denoise loss 加权求和 -------
-        loss = 0.0
-        for name, weight in cfg.train.losses.items():
-            if name in denoise_loss_dict and denoise_loss_dict[name] is not None:
-                loss = loss + float(weight) * denoise_loss_dict[name]
-
-        # ------- 加上 mirroring 约束 -------
-        loss = loss + cfg.train.mirror_shape_weight * loss_shape_mirror
+        loss = loss_denoise  # 目前先只用这一个 term，先训通
 
         # ------- 反向 + 更新 -------
         optimizer.zero_grad(set_to_none=True)
@@ -193,21 +217,15 @@ def main():
             loss=float(loss.item()),
         )
 
-        # ------- 打日志（包含我们新的 loss） -------
+        # ------- 日志 -------
         if global_step % print_step_freq == 0:
-            loss_terms = [
-                f"{k}: {v.item():.4f}" for k, v in denoise_loss_dict.items()
-            ]
-            loss_terms.append(f"mirror_shape: {loss_shape_mirror.item():.4f}")
-            loss_str = " | ".join(loss_terms)
-
             logger.info(
                 f"[step {global_step}/{max_steps}] "
-                f"loss={loss.item():.4f}  ({loss_str})  "
+                f"loss_denoise={loss_denoise.item():.4f} "
                 f"data_time={data_time:.3f}s  iter_time={iter_time:.3f}s"
             )
 
-        # ------- 保存 checkpoint（跟你原来一样） -------
+        # ------- 保存 checkpoint -------
         if global_step % ckpt_freq == 0 or global_step == max_steps:
             ckpt_dir = Path(cfg.env.experiments_folder) / cfg.run.name
             ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -224,8 +242,8 @@ def main():
             )
             logger.info(f"Checkpoint saved to {ckpt_path}")
 
-
     logger.info(f"Training finished in {(time.time() - t_start) / 3600:.2f} h")
+
 
 
 if __name__ == "__main__":

@@ -5,8 +5,8 @@ run:
     - human_pair
 
 dataloader:
-  batch_size: 16
-  workers: 4
+  batch_size: 4096
+  workers: 12
   sampler: default
 
 model_denoising:

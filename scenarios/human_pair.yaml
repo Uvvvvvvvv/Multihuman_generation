@@ -5,7 +5,7 @@ run:
     - human_pair
 
 dataloader:
-  batch_size: 4096
+  batch_size: 6144
   workers: 12
   sampler: default
 
@@ -37,7 +37,7 @@ model:
   beta_schedule: linear
 
 train:
-  max_steps: 100000
+  max_steps: 50000
   log_step_freq: 20
   checkpoint_freq: 5000
   print_step_freq: 50

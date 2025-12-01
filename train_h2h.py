@@ -186,7 +186,7 @@ def main():
         ckpt_dir = Path(cfg.env.experiments_folder) / cfg.run.name
         ckpt_path = ckpt_dir / f"step_{RESUME_STEP:06d}.pt"
         if ckpt_path.is_file():
-            ckpt = torch.load(ckpt_path, map_location=device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state"])
             if "optimizer_state" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -221,7 +221,7 @@ def main():
         total=max_steps,
     )
 
-    for _ in progress:
+    for global_step in progress:
         model.train()
 
         # ------- 取一个 batch -------

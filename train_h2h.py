@@ -17,7 +17,7 @@ from tridi.model.tridi import TriDiModel
 # ============================================================
 #  手动设置：是否从某个 step 继续训练
 # ============================================================
-RESUME_STEP = 2500          # 你的 checkpoint 是 step_002500.pt
+RESUME_STEP = 5000          # 例如已有 step_005000.pt
 USE_RESUME = True           # 想从头训练就改成 False
 # ============================================================
 
@@ -26,7 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
-logger = logging.getLogger("train_h2h")
+logger = getLogger = logging.getLogger("train_h2h")
 
 
 def load_config():
@@ -87,7 +87,7 @@ def build_optimizer(cfg, model):
 @torch.no_grad()
 def evaluate(model, val_loader, scheduler_ddpm, device, max_batches: int = 50):
     """
-    在 val_loader 上跑若干个 batch，计算平均的 epsilon MSE loss。
+    在 val_loader 上跑若干个 batch，计算平均 epsilon MSE loss。
     """
     model.eval()
     T = scheduler_ddpm.config.num_train_timesteps
@@ -122,7 +122,7 @@ def evaluate(model, val_loader, scheduler_ddpm, device, max_batches: int = 50):
             obj_group=None,
             contact_map=contact_t,
             t=torch.zeros_like(t_obj),  # H1 t=0
-            t_aux=t_obj,               # H2 t=t_obj
+            t_aux=t_obj,                # H2 t=t_obj
             obj_pointnext=None,
         )
 
@@ -158,6 +158,10 @@ def main():
     logger.info(f"Using device: {device}")
 
     # ------------ DataLoader ------------
+    # 这里的 get_train_dataloader 已经实现了 80/10/10 划分：
+    #   train_loader -> 80%
+    #   val_loader   -> 10%
+    #   test 目前不返回，在 dataloader 内部被丢弃或预留
     t0 = time.time()
     train_loader, val_loader, mesh_info, kpts_info = get_train_dataloader(cfg)
     logger.info(
@@ -210,7 +214,6 @@ def main():
     train_iter = iter(train_loader)
 
     logger.info("Start training H2H (epsilon prediction on H2 only) ...")
-    global_step = start_step
     t_start = time.time()
 
     progress = tqdm(
@@ -221,7 +224,10 @@ def main():
         total=max_steps,
     )
 
-    for global_step in progress:
+    # 注意：这里用 step 来驱动循环，global_step = step + 1，避免重复自增
+    for step in progress:
+        global_step = step + 1
+
         model.train()
 
         # ------- 取一个 batch -------
@@ -283,7 +289,6 @@ def main():
         clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        global_step += 1
         iter_time = time.time() - t_data0
 
         progress.set_postfix(
@@ -310,7 +315,7 @@ def main():
             )
             logger.info(
                 f"[Eval step {global_step}] "
-                f"val_loss={val_loss:.4f} (over {eval_batches} batches)"
+                f"val_loss={val_loss:.4f} (over <= {eval_batches} batches)"
             )
 
             ckpt_dir = Path(cfg.env.experiments_folder) / cfg.run.name

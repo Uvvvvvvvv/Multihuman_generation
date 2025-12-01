@@ -14,7 +14,7 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair/step_100000.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair/step_002500.pt"
 
 # 如果为 None，就用 ckpt 里的 cfg.env.datasets_folder
 DATASET_ROOT = None

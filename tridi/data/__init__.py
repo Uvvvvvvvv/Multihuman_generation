@@ -55,9 +55,10 @@ def get_train_dataloader(cfg: ProjectConfig):
         num_workers=cfg.dataloader.workers,
         drop_last=True,
         sampler=sampler,
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=BatchData.collate,
-        persistent_workers=True,   # H5 适合开这个，加速很多
+        persistent_workers=False,   # H5 适合开这个，加速很多
+        prefetch_factor=1,
     )
 
     val_loader = torch.utils.data.DataLoader(

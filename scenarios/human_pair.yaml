@@ -6,7 +6,7 @@ run:
 
 dataloader:
   batch_size: 6144
-  workers: 6
+  workers: 12
   sampler: default
 
 model_denoising:
@@ -37,7 +37,7 @@ model:
   beta_schedule: linear
 
 train:
-  max_steps: 50000
+  max_steps: 150000
   log_step_freq: 20
   checkpoint_freq: 2500
   print_step_freq: 50

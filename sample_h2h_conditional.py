@@ -14,7 +14,7 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair/step_002500.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair/step_120000.pt"
 
 # 如果为 None，就用 ckpt 里的 cfg.env.datasets_folder
 DATASET_ROOT = None
@@ -30,7 +30,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 从多少个不同的 Human1 condition 上采样
-NUM_SUBJECTS = 3
+NUM_SUBJECTS = 5
 # 每个 Human1 条件采几份 Human2
 SAMPLES_PER_SUBJECT = 3
 # 反向扩散步数

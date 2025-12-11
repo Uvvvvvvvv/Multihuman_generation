@@ -1,4 +1,4 @@
-# sample_h2h.py
+# sample_h2h_overfit.py
 import os
 from pathlib import Path
 from typing import Tuple
@@ -15,8 +15,8 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_overfit10frames/step_167500.pt"
-#python sample_h2h.py
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_overfit10frames/step_010000.pt"
+#python sample1.py
 # 如果为 None，就用 ckpt 里的 cfg.env.datasets_folder
 DATASET_ROOT = None
 # DATASET_ROOT = "/media/uv/Data/workspace/tridi/embody-3d/datasets"
@@ -25,16 +25,17 @@ DATASET_ROOT = None
 SMPLX_MODEL_PATH = "/media/uv/Data/workspace/tridi/smplx/models"
 
 # 输出 OBJ 的目录
-OUTPUT_DIR = "/media/uv/Data/workspace/tridi/samples/h2h_manual"
+OUTPUT_DIR = "/media/uv/Data/workspace/tridi/samples/h2h_overfit_recon"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 从多少个不同的 Human1 condition 上采样
-NUM_SUBJECTS = 1
-# 每个 Human1 条件采几份 Human2
-SAMPLES_PER_SUBJECT = 10
-# 反向扩散步数（和训练用的 ddpm 一致时一般取 250 或 1000）
+# 你 overfit 用的那 10 帧
+FRAME_INDICES = [1,1000,9999,66666,123456,654321,666666,999999,1234567,2345678] 
+
+# 每个条件帧，从纯噪声采多少个 sample
+SAMPLES_PER_FRAME = 2
+# 反向扩散步数（和训练 ddpm 一致时通常 250 / 1000）
 NUM_DIFFUSION_STEPS = 250
 
 
@@ -119,9 +120,7 @@ def load_dataset(cfg) -> Embody3DH2HDataset:
 # ===========================
 def wrap_axis_angle(vec: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    vec: (..., 3) 形式的 axis-angle 向量
-    将旋转角 wrap 到 [-pi, pi]，避免出现 10π 这种离谱关节。
-    使用 reshape 而不是 view，避免 non-contiguous 的坑。
+    vec: (..., 3) 形式的 axis-angle 向量，将旋转角 wrap 到 [-pi, pi]。
     """
     import math
 
@@ -137,111 +136,13 @@ def wrap_axis_angle(vec: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 # ===========================
-# 4) 手写 DDPM：给定一个 Human1，条件采样多个 Human2
-# ===========================
-@torch.no_grad()
-def conditional_sample_h2_ddpm(
-    model: TriDiModel,
-    scheduler,
-    batch_cond: BatchData,
-    num_samples: int,
-    num_steps: int,
-) -> torch.Tensor:
-    """
-    使用和训练时一致的 ε-loss 语义，手写 DDPM 反推，只在 H2 上扩散。
-    batch_cond: 单个 BatchData（包含 sbj_* 和 obj_*，这里只用 sbj_* 做条件）
-    返回: (num_samples, D_sbj + D_obj) 的参数向量
-    """
-    device = DEVICE
-
-    # 把单个样本 collate 成 B=1 的 batch
-    batch_base = BatchData.collate([batch_cond]).to(device)
-
-    D_sbj = model.data_sbj_channels
-    D_obj = model.data_obj_channels
-
-    scheduler_ddpm = scheduler
-    results = []
-
-    print(f"[INFO] Conditioning on one Human1, sampling {num_samples} Human2 via manual DDPM")
-
-    for k in range(num_samples):
-        # 每个 sample 单独 seed，方便复现
-        seed = int.from_bytes(os.urandom(8), "big") % (2**31 - 1)
-        torch.manual_seed(seed)
-        print(f"  [DEBUG] sample {k+1}/{num_samples}, seed={seed}")
-
-        batch = batch_base
-
-        sbj_vec = model.merge_input_sbj(batch).to(device)  # (1, D_sbj)
-        B = sbj_vec.shape[0]
-
-        # H2 从噪声开始
-        obj = torch.randn(B, D_obj, device=device)
-
-        scheduler_ddpm.set_timesteps(num_steps)
-        timesteps = scheduler_ddpm.timesteps.to(device)
-
-        for t in timesteps:
-            if not torch.is_tensor(t):
-                t_step = torch.tensor(t, device=device, dtype=torch.long)
-            else:
-                t_step = t.to(device)
-
-            t_batch = t_step.expand(B)
-
-            if model.data_contacts_channels > 0:
-                contact_t = torch.zeros(
-                    B,
-                    model.data_contacts_channels,
-                    device=device,
-                    dtype=sbj_vec.dtype,
-                )
-            else:
-                contact_t = torch.zeros(B, 0, device=device, dtype=sbj_vec.dtype)
-
-            x_t = torch.cat([sbj_vec, obj], dim=1)  # (B, D_sbj + D_obj)
-
-            x_t_input = model.get_input_with_conditioning(
-                x_t,
-                obj_group=None,
-                contact_map=contact_t,
-                t=torch.zeros_like(t_batch),  # H1 t=0
-                t_aux=t_batch,                # H2 当前时间步
-                obj_pointnext=None,
-            )
-
-            t_sbj = torch.zeros_like(t_batch)
-            t_contact = torch.zeros_like(t_batch)
-
-            eps_pred_full = model.denoising_model(
-                x_t_input,
-                t=t_sbj,
-                t_obj=t_batch,
-                t_contact=t_contact,
-            )
-
-            eps_pred_obj = eps_pred_full[:, D_sbj : D_sbj + D_obj]
-
-            step_out = scheduler_ddpm.step(eps_pred_obj, t_step, obj)
-            obj = step_out.prev_sample
-
-        # 反推结束的 obj 就是 H2 的 x0
-        params = torch.cat([sbj_vec, obj], dim=1)[0].detach().cpu()
-        results.append(params)
-
-    all_params = torch.stack(results, dim=0)  # (num_samples, D_sbj + D_obj)
-    return all_params
-
-
-# ===========================
-# 5) 从 dataset 里构造一帧的 GT (H1+H2) 参数
+# 4) 构造一帧的 GT (H1+H2) 参数
 # ===========================
 def build_gt_params(single: BatchData) -> np.ndarray:
     """
-    使用和训练时 merge_input_* 一致的拼法：
+    和训练时 merge_input_* 一致：
     H1: sbj_shape + sbj_global + sbj_pose + sbj_c
-    H2: obj_shape + obj_global + obj_pose + obj_c  （H2H 里 obj_* 实际是第二个人）
+    H2: obj_shape + obj_global + obj_pose + obj_c （H2H 里 obj_* 实际是第二个人）
     """
     h1 = torch.cat(
         [single.sbj_shape, single.sbj_global, single.sbj_pose, single.sbj_c], dim=0
@@ -254,16 +155,11 @@ def build_gt_params(single: BatchData) -> np.ndarray:
 
 
 # ===========================
-# 6) 尝试从 dataset 里挖出一点 meta 信息
+# 5) 尝试从 dataset 里挖一点 meta 信息
 # ===========================
 def get_dataset_meta(dataset: Embody3DH2HDataset, idx: int) -> str:
-    """
-    尽力从 dataset 里读一些有用的信息（不会因为没有这些字段而报错）。
-    例如 sequence 名、frame index、h5 路径等等。
-    """
     pieces = [f"idx={idx}"]
 
-    # 尝试一些常见的字段名
     for name in ["sequence_names", "seq_names", "sequences"]:
         arr = getattr(dataset, name, None)
         if arr is not None:
@@ -293,7 +189,7 @@ def get_dataset_meta(dataset: Embody3DH2HDataset, idx: int) -> str:
 
 
 # ===========================
-# 7) SMPL-X 重建并保存 OBJ（双人）
+# 6) SMPL-X 重建并保存 OBJ（双人）
 # ===========================
 _SMPLX_MODEL = None
 _SMPLX_DEVICE = torch.device("cpu")
@@ -414,89 +310,190 @@ def smplx_reconstruct(params: np.ndarray, output_file: str):
 
 
 # ===========================
-# Main
+# 7) DDPM 采样（统一成 x0 语义）
+# ===========================
+@torch.no_grad()
+def conditional_sample_h2_ddpm_x0(
+    model: TriDiModel,
+    scheduler,
+    batch_cond: BatchData,
+    num_samples: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """
+    使用 x0-loss 语义的 DDPM 反推，只在 H2 上扩散，H1 用 GT 作为条件。
+    返回: (num_samples, D_sbj + D_obj)
+    """
+    device = DEVICE
+
+    batch_base = BatchData.collate([batch_cond]).to(device)
+
+    D_sbj = model.data_sbj_channels
+    D_obj = model.data_obj_channels
+
+    scheduler_ddpm = scheduler
+    results = []
+
+    print(f"[INFO] Conditioning on one H1, sampling {num_samples} H2 via DDPM-x0")
+
+    for k in range(num_samples):
+        seed = int.from_bytes(os.urandom(8), "big") % (2**31 - 1)
+        torch.manual_seed(seed)
+        print(f"  [DEBUG] sample {k+1}/{num_samples}, seed={seed}")
+
+        batch = batch_base
+
+        sbj_vec = model.merge_input_sbj(batch).to(device)  # (1, D_sbj)
+        B = sbj_vec.shape[0]
+
+        # H2 从纯噪声开始
+        obj = torch.randn(B, D_obj, device=device)
+
+        scheduler_ddpm.set_timesteps(num_steps)
+        timesteps = scheduler_ddpm.timesteps.to(device)
+
+        for t in timesteps:
+            if not torch.is_tensor(t):
+                t_step = torch.tensor(t, device=device, dtype=torch.long)
+            else:
+                t_step = t.to(device)
+
+            t_batch = t_step.expand(B)
+
+            if model.data_contacts_channels > 0:
+                contact_t = torch.zeros(
+                    B,
+                    model.data_contacts_channels,
+                    device=device,
+                    dtype=sbj_vec.dtype,
+                )
+            else:
+                contact_t = torch.zeros(B, 0, device=device, dtype=sbj_vec.dtype)
+
+            # 当前 noisy 参数（H1 GT, H2 noisy）
+            x_t = torch.cat([sbj_vec, obj], dim=1)  # (B, D_sbj + D_obj)
+
+            # H1 的 t=0（完全观测），H2 的 t=t_batch
+            x_t_input = model.get_input_with_conditioning(
+                x_t,
+                obj_group=None,
+                contact_map=contact_t,
+                t=torch.zeros_like(t_batch),  # H1 t=0
+                t_aux=t_batch,                # H2 当前时间步
+                obj_pointnext=None,
+            )
+
+            t_sbj = torch.zeros_like(t_batch)
+            t_contact = torch.zeros_like(t_batch)
+
+            # 这里网络输出的是 x0_pred（因为训练就是 x0-L1）
+            x0_pred_full = model.denoising_model(
+                x_t_input,
+                t=t_sbj,
+                t_obj=t_batch,
+                t_contact=t_contact,
+            )
+
+            x0_pred_obj = x0_pred_full[:, D_sbj : D_sbj + D_obj]
+
+            # scheduler 已经设成 prediction_type="sample"，所以这里直接给 x0_pred_obj
+            step_out = scheduler_ddpm.step(x0_pred_obj, t_step, obj)
+            obj = step_out.prev_sample
+
+        params = torch.cat([sbj_vec, obj], dim=1)[0].detach().cpu()
+        results.append(params)
+
+    all_params = torch.stack(results, dim=0)  # (num_samples, D_sbj + D_obj)
+    return all_params
+
+
+# ===========================
+# Main：单步重建 + DDPM 采样
 # ===========================
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
+
     # 1) 加载模型 & cfg
     model, cfg = load_model_from_ckpt(CKPT_PATH)
 
-    # 用 model 里的 ddpm scheduler（手写采样会用到）
+    # 用 model 里的 ddpm scheduler，并设成 x0 语义
     scheduler_ddpm = model.schedulers_map["ddpm"]
+    # Route A：统一成 "sample"（x0）语义
+    if hasattr(scheduler_ddpm, "config") and hasattr(scheduler_ddpm.config, "prediction_type"):
+        scheduler_ddpm.config.prediction_type = "sample"
+    else:
+        # 保险起见，万一 diffusers 版本字段名不一样
+        setattr(scheduler_ddpm, "prediction_type", "sample")
 
     # 2) 加载 Embody3D-H2H 数据
     dataset = load_dataset(cfg)
-
     N = len(dataset)
     print(f"[INFO] Dataset size = {N} frames")
 
-    num_subj = min(NUM_SUBJECTS, N)
+    frame_indices = [idx for idx in FRAME_INDICES if idx < N]
+    print(f"[INFO] Will reconstruct frame indices: {frame_indices}")
 
-    # 随机选 num_subj 个 index，当作 H1 条件
-    all_indices = np.arange(N)
-    np.random.seed(0)
-    subj_indices = np.random.choice(all_indices, size=num_subj, replace=False).tolist()
-
-    print(f"[INFO] Using subject indices (frame indices): {subj_indices}")
-
-    # meta 映射文件：记录 idx / sample / 对应 GT / 一点 dataset meta
-    meta_path = os.path.join(OUTPUT_DIR, "sample_meta.txt")
+    meta_path = os.path.join(OUTPUT_DIR, "overfit_recon_meta.txt")
     with open(meta_path, "w") as meta_fp:
-        meta_fp.write("# idx,sample_id,gt_obj_path,sample_obj_path,meta_info\n")
+        meta_fp.write("# idx,gt_obj_path,recon_obj_path,sample_obj_path,L1_H1,L1_H2,meta_info\n")
 
-        for i_subj, idx in enumerate(subj_indices):
-            print(
-                f"\n====== Condition subject #{i_subj+1}/{num_subj}, "
-                f"dataset idx={idx} ======"
-            )
+        for idx in frame_indices:
+            print(f"\n====== Frame idx={idx} ======")
             single = dataset[idx]
 
-            # 打印一下 H1 的前 5 个 betas 作为 debug
-            sbj_vec_1d = torch.cat(
-                [single.sbj_shape, single.sbj_global, single.sbj_pose, single.sbj_c], dim=0
-            )
-            print("  [DEBUG] cond H1 first 5 betas:", sbj_vec_1d[:5].cpu().numpy())
-
-            # ---- 先保存这一帧的 GT (H1+H2) ----
+            # ---- 1) 保存这一帧的 GT (H1+H2) ----
             gt_params = build_gt_params(single)
             gt_out_path = os.path.join(
-                OUTPUT_DIR, f"h2h_manual_idx{idx:07d}_GT.obj"
+                OUTPUT_DIR, f"h2h_overfit_idx{idx:07d}_GT.obj"
             )
             smplx_reconstruct(gt_params, gt_out_path)
 
-            # ---- 条件采样多个 Human2（手写 DDPM）----
-            all_params = conditional_sample_h2_ddpm(
+            # ---- 2) 单步 x0 重建（跟训练完全一样）----
+            batch = BatchData.collate([single]).to(DEVICE)
+
+            sbj_vec = model.merge_input_sbj(batch).to(DEVICE)   # (1, D_sbj)
+            obj_vec = model.merge_input_obj(batch).to(DEVICE)   # (1, D_obj)
+
+            loss_dict, aux_output = model.forward_train(
+                sbj_vec, obj_vec, return_intermediate_steps=True
+            )
+            x_0_pred = aux_output[3][0].detach().cpu().numpy()  # (918,)
+
+            L1_H1 = float(loss_dict["denoise_1"].item())
+            L1_H2 = float(loss_dict["denoise_2"].item())
+            print(f"  [RECON] L1(H1)={L1_H1:.6f}, L1(H2)={L1_H2:.6f}")
+
+            recon_out_path = os.path.join(
+                OUTPUT_DIR, f"h2h_overfit_idx{idx:07d}_RECON.obj"
+            )
+            smplx_reconstruct(x_0_pred, recon_out_path)
+
+            # ---- 3) DDPM 采样：H1 作为条件，从噪声 sample 多个 H2 ----
+            all_params = conditional_sample_h2_ddpm_x0(
                 model,
                 scheduler_ddpm,
                 single,
-                num_samples=SAMPLES_PER_SUBJECT,
+                num_samples=SAMPLES_PER_FRAME,
                 num_steps=NUM_DIFFUSION_STEPS,
-            )  # (SAMPLES_PER_SUBJECT, 918)
+            )  # (S, 918)
 
             all_params_np = all_params.numpy()
 
-            # 一点 dataset meta 信息（比如 sequence / frame 等）
             meta_info = get_dataset_meta(dataset, idx)
 
-            # ---- 为每个 sample 保存 OBJ 并写入 meta 映射 ----
-            for k in range(SAMPLES_PER_SUBJECT):
-                params = all_params_np[k]
-                print(
-                    f"  [INFO] idx={idx}, sample {k+1}: "
-                    f"H1 betas[0:5]={np.round(params[:5], 4)}, "
-                    f"H2 betas[0:5]={np.round(params[459:459+5], 4)}"
-                )
-
+            for k in range(SAMPLES_PER_FRAME):
+                params_k = all_params_np[k]
                 sample_out_path = os.path.join(
-                    OUTPUT_DIR, f"h2h_manual_idx{idx:07d}_sample{k:02d}.obj"
+                    OUTPUT_DIR, f"h2h_overfit_idx{idx:07d}_SAMPLE{k:02d}.obj"
                 )
-                smplx_reconstruct(params, sample_out_path)
+                smplx_reconstruct(params_k, sample_out_path)
 
-                # 记录一行 mapping：哪个 idx + sample_id -> 哪两个 obj 文件
                 meta_fp.write(
-                    f"{idx},{k},{gt_out_path},{sample_out_path},{meta_info}\n"
+                    f"{idx},{gt_out_path},{recon_out_path},{sample_out_path},"
+                    f"{L1_H1:.8f},{L1_H2:.8f},{meta_info}\n"
                 )
 
     print(
         "\n[INFO] Done! "
-        "Check OBJ files and sample_meta.txt in the output folder.\n"
+        "Check OBJ files and overfit_recon_meta.txt in the output folder.\n"
     )

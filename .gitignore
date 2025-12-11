@@ -11,7 +11,7 @@ data/*
 !data/*.py
 samples/
 smplx/
-
+wandb/
 
 *.ply
 *.png

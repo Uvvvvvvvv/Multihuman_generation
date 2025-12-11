@@ -1,6 +1,8 @@
 import os
 from copy import deepcopy
 from pathlib import Path
+import inspect
+from tqdm.auto import tqdm
 
 import numpy as np
 import torch
@@ -14,7 +16,9 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair/step_120000.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_eachsequence_1frame/step_050000.pt"
+#python sample_h2h_conditional.py
+
 
 # 如果为 None，就用 ckpt 里的 cfg.env.datasets_folder
 DATASET_ROOT = None
@@ -30,9 +34,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 从多少个不同的 Human1 condition 上采样
-NUM_SUBJECTS = 5
+NUM_SUBJECTS = 3
 # 每个 Human1 条件采几份 Human2
-SAMPLES_PER_SUBJECT = 3
+SAMPLES_PER_SUBJECT = 6
 # 反向扩散步数
 NUM_DIFFUSION_STEPS = 250
 
@@ -122,6 +126,121 @@ def load_dataset(cfg) -> Embody3DH2HDataset:
     ds = Embody3DH2HDataset(root=root)
     return ds
 
+@torch.no_grad()
+def ddpm_x0_sample_h2h(
+    model: TriDiModel,
+    batch: BatchData,
+    mode_str: str = "010",
+    scheduler_name: str = "ddpm",
+    num_inference_steps: int = 250,
+    eta: float = 0.0,
+) -> torch.Tensor:
+    """
+    纯采样函数：不改 tridi.py，自己在 sample 脚本里手写一个 ddpm-x0 反推 loop。
+
+    返回: (B=1, D_sbj + D_obj) 的 x_0（H1+H2 参数）
+    """
+    device = DEVICE
+    mode = mode_str  # "010" 这种字符串
+    B = 1 if batch is None else batch.batch_size()
+
+    D_sbj = model.data_sbj_channels
+    D_obj = model.data_obj_channels
+
+    # ----------------- 初始化 H1/H2 状态 -----------------
+    # H1：采样 or 条件
+    if mode[0] == "1":
+        x_t_sbj = torch.randn(B, D_sbj, device=device)
+        x_sbj_cond = None
+    else:
+        x_sbj_cond = model.merge_input_sbj(batch).to(device)       # 和 train 一致
+        x_t_sbj = x_sbj_cond.detach().clone()
+
+    # H2：采样 or 条件
+    if mode[1] == "1":
+        x_t_h2 = torch.randn(B, D_obj, device=device)
+        x_h2_cond = None
+    else:
+        x_h2_cond = model.merge_input_obj(batch).to(device)        # 和 train 一致
+        x_t_h2 = x_h2_cond.detach().clone()
+
+    # ----------------- scheduler 设置 -----------------
+    scheduler_obj = model.schedulers_map[scheduler_name]
+
+    accepts_offset = "offset" in set(
+        inspect.signature(scheduler_obj.set_timesteps).parameters.keys()
+    )
+    extra_set_kwargs = {"offset": 1} if accepts_offset else {}
+    scheduler_obj.set_timesteps(num_inference_steps, **extra_set_kwargs)
+
+    accepts_eta = "eta" in set(
+        inspect.signature(scheduler_obj.step).parameters.keys()
+    )
+    extra_step_kwargs = {"eta": eta} if accepts_eta else {}
+
+    # contact time 一律 0（H2H 不用 contact）
+    # ----------------- 反向扩散 loop -----------------
+    for i, t in enumerate(
+        tqdm(scheduler_obj.timesteps.to(device), desc=f"DDPM x0 ({mode})", ncols=80)
+    ):
+        # 对于不采样的那条 stream，我们把它的 t 永远设成 0，相当于告诉网络“已经干净”
+        t_sbj_scalar = t if mode[0] == "1" else torch.zeros_like(t)
+        t_h2_scalar = t if mode[1] == "1" else torch.zeros_like(t)
+
+        t_sbj = t_sbj_scalar.reshape(1).expand(B)
+        t_h2 = t_h2_scalar.reshape(1).expand(B)
+        t_contact = torch.zeros_like(t_sbj)
+
+        # 拼成完整 x_t（H1 + H2）
+        x_t_full = torch.cat([x_t_sbj, x_t_h2], dim=1)
+
+        # 加 conditioning
+        x_t_input = model.get_input_with_conditioning(
+            x_t_full, t=t_sbj, t_aux=t_h2
+        )
+
+        # 网络预测 x_0（或者 scheduler 配置下需要的东西）
+        x0_pred_full = model.denoising_model(
+            x_t_input,
+            t=t_sbj,
+            t_obj=t_h2,
+            t_contact=t_contact,
+        )  # 形状: (B, D_sbj + D_obj)
+
+        # 只把需要“采样”的维度扔进 scheduler.step
+        pred_chunks = []
+        if mode[0] == "1":
+            pred_chunks.append(x0_pred_full[:, :D_sbj])
+        if mode[1] == "1":
+            pred_chunks.append(x0_pred_full[:, D_sbj:D_sbj + D_obj])
+        pred = torch.cat(pred_chunks, dim=1)
+
+        x_t_chunks = []
+        if mode[0] == "1":
+            x_t_chunks.append(x_t_sbj)
+        if mode[1] == "1":
+            x_t_chunks.append(x_t_h2)
+        x_t_sample = torch.cat(x_t_chunks, dim=1)
+
+        step_out = scheduler_obj.step(pred, t.item(), x_t_sample, **extra_step_kwargs)
+        x_t_updated = step_out.prev_sample
+
+        # 把更新后的维度按 mode 拆回去，其余的直接用条件覆盖
+        offset = 0
+        if mode[0] == "1":
+            x_t_sbj = x_t_updated[:, :D_sbj]
+            offset += D_sbj
+        else:
+            x_t_sbj = x_sbj_cond
+
+        if mode[1] == "1":
+            x_t_h2 = x_t_updated[:, offset:offset + D_obj]
+        else:
+            x_t_h2 = x_h2_cond
+
+    # 最终 x_0（H1 + H2）
+    x0_full = torch.cat([x_t_sbj, x_t_h2], dim=1)  # (B, D_sbj + D_obj)
+    return x0_full
 
 # ===========================
 # 3) 给定一个 Human1，条件采样多个 Human2
@@ -136,19 +255,17 @@ def conditional_sample_h2h(
     scheduler_name: str = "ddpm",
 ) -> torch.Tensor:
     """
-    batch_cond: 包含 sbj_*（Human1）和 obj_* (Human2 GT, 但这里只用 sbj_* 做条件)
-    num_samples: 对同一个 H1 采多少个 H2
-    返回: (num_samples, D_sbj + D_obj + D_contact)
+    给定一个 Human1（来自 batch_cond），条件采样多个 Human2。
+    返回: (num_samples, D_sbj + D_obj)
     """
     device = DEVICE
-    mode = mode_str  # TriDiModel.forward_sample 里是拿字符串比较 "1"/"0"
+    mode = mode_str
 
     # 先把单个 BatchData 变成 batched（B=1）
     batch = BatchData.collate([batch_cond]).to(device)
 
     D_sbj = model.data_sbj_channels
     D_obj = model.data_obj_channels
-    D_contact = model.data_contacts_channels
 
     all_params = []
 
@@ -158,44 +275,65 @@ def conditional_sample_h2h(
         # 为了 debug，给每次采样一个不同的 seed
         seed = int.from_bytes(os.urandom(8), "big") % (2**31 - 1)
         print(f"  [DEBUG] sample {k+1}/{num_samples}, seed={seed}")
+        torch.manual_seed(seed)
+        np.random.seed(seed % (2**32 - 1))
 
-        out = model.forward_sample(
-            mode=mode,
+        x0_full = ddpm_x0_sample_h2h(
+            model=model,
             batch=batch,
-            scheduler=scheduler_name,
+            mode_str=mode,
+            scheduler_name=scheduler_name,
             num_inference_steps=steps,
             eta=0.0,
-            return_sample_every_n_steps=-1,
-            disable_tqdm=False,
-            seed=seed,
-        )
+        )  # (1, D_sbj + D_obj)
 
-        # out: (B=1, D_sbj + D_obj + D_contact)
-        params = out[0].detach().cpu()
+        params = x0_full[0].detach().cpu()
         all_params.append(params)
 
     all_params = torch.stack(all_params, dim=0)  # (num_samples, D_total)
 
-    # Debug: 看看不同采样之间 Human2 参数差异
+    # Debug: 看不同 sample 的 H2 差异
     if num_samples >= 2:
         base = all_params[0, D_sbj : D_sbj + D_obj]  # 第一个 H2
         for k in range(1, num_samples):
             diff = torch.max(
                 torch.abs(all_params[k, D_sbj : D_sbj + D_obj] - base)
             ).item()
-            print(f"  [DEBUG] max |Δparams_obj| between sample[0] and sample[{k}] = {diff}")
+            print(f"  [DEBUG] max |Δparams_H2| between sample[0] and sample[{k}] = {diff:.6f}")
 
-    # 再看一下 Human1 是否保持不变
+    # 再看 H1 是不是保持不变
     sbj0 = all_params[0, :D_sbj]
     for k in range(1, num_samples):
         dsbj = torch.max(torch.abs(all_params[k, :D_sbj] - sbj0)).item()
-        print(f"  [DEBUG] max |Δparams_sbj| between sample[0] and sample[{k}] (should be ~0) = {dsbj}")
+        print(f"  [DEBUG] max |Δparams_H1| between sample[0] and sample[{k}] (should be ~0) = {dsbj:.6f}")
 
-    return all_params  # (num_samples, D_total)
+    return all_params
+
 
 
 # ===========================
-# 4) SMPL-X 重建并保存 OBJ（双人）
+# 4) 一些 axis-angle 的处理函数   ==== NEW ====
+# ===========================
+def wrap_axis_angle(vec: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    vec: (..., 3) 形式的 axis-angle 向量
+    将旋转角 wrap 到 [-pi, pi]，避免出现 10π 这种离谱关节。
+    """
+    orig_shape = vec.shape
+    vec = vec.view(-1, 3)
+
+    angle = torch.linalg.norm(vec, dim=-1, keepdim=True)         # (...,1)
+    axis = vec / (angle + eps)
+
+    # 将角度 wrap 到 [-pi, pi]
+    angle_wrapped = (angle + np.pi) % (2 * np.pi) - np.pi
+
+    vec_wrapped = axis * angle_wrapped
+    return vec_wrapped.view(orig_shape)
+
+
+# ===========================
+# 5) SMPL-X 重建并保存 OBJ（双人）
 # ===========================
 def smplx_reconstruct(params: np.ndarray, output_file: str):
     """
@@ -254,14 +392,19 @@ def smplx_reconstruct(params: np.ndarray, output_file: str):
         betas = betas_used.unsqueeze(0)  # (1, num_betas_model)
 
         # global_orient
-        global_orient = torch.tensor(
+        global_orient_vec = torch.tensor(
             p[300:303], dtype=torch.float32, device=SMPL_DEVICE
         ).unsqueeze(0)  # (1,3)
+        # ==== NEW: wrap 一下根关节 ====
+        global_orient_vec = wrap_axis_angle(global_orient_vec)
 
         # body + hands pose
         pose_all = torch.tensor(
             p[303:456], dtype=torch.float32, device=SMPL_DEVICE
-        ).unsqueeze(0)  # (1,153)
+        )  # (153,)
+        # ==== NEW: 对所有 51 个关节做 wrap ====
+        pose_all = wrap_axis_angle(pose_all.view(-1, 3)).view(1, -1)  # (1,153)
+
         body_pose = pose_all[:, :63]          # (1,63)
         left_hand_pose = pose_all[:, 63:108]  # (1,45)
         right_hand_pose = pose_all[:, 108:153]# (1,45)
@@ -270,7 +413,13 @@ def smplx_reconstruct(params: np.ndarray, output_file: str):
             p[456:459], dtype=torch.float32, device=SMPL_DEVICE
         ).unsqueeze(0)  # (1,3)
 
-        return betas, global_orient, body_pose, left_hand_pose, right_hand_pose, transl
+        # ==== NEW: 打个 debug，看看角度范围 ====
+        with torch.no_grad():
+            angles = pose_all.view(-1, 3).norm(dim=-1)
+            print(f"    [DEBUG] pose max-angle = {angles.max().item():.3f}, "
+                  f"mean-angle = {angles.mean().item():.3f}")
+
+        return betas, global_orient_vec, body_pose, left_hand_pose, right_hand_pose, transl
 
     betas1, global1, body1, lhand1, rhand1, transl1 = parse_one(h1)
     betas2, global2, body2, lhand2, rhand2, transl2 = parse_one(h2)
@@ -335,7 +484,6 @@ if __name__ == "__main__":
     subj_indices = np.random.choice(all_indices, size=num_subj, replace=False).tolist()
 
     print(f"[INFO] Using subject indices (frame indices): {subj_indices}")
-
 
     for i_subj, idx in enumerate(subj_indices):
         print(f"\n====== Condition subject #{i_subj+1}/{num_subj}, dataset idx={idx} ======")

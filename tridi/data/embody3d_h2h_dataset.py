@@ -171,6 +171,9 @@ class Embody3DH2HDataset(Dataset):
 # ============================================================
 # 新版本：基于 HDF5 的 Embody3D H2H Dataset（支持 indices）
 # ============================================================
+# ============================================================
+# 新版本：基于 HDF5 的 Embody3D H2H Dataset（支持 indices + sequence_ids）
+# ============================================================
 class Embody3DH2HH5Dataset(Dataset):
     """
     使用预处理好的 H5 文件：
@@ -179,23 +182,50 @@ class Embody3DH2HH5Dataset(Dataset):
         sbj_pose: (N, 153)
         sbj_c: (N, 3)
         obj_shape, obj_global, obj_pose, obj_c: 同上
-        seq_name: (N,)  — 仅用于 split，不在这里用
+        seq_name: (N,)  — 用来区分 sequence
         frame_idx: (N,) — 可选 meta
 
     这里 Dataset 支持传入 indices，用于 80/10/10 的 train/val/test 划分。
+    同时暴露每帧对应的 sequence id 到 self.sequence_ids，方便上层按 sequence 采样。
     """
 
     def __init__(self, h5_path, indices=None):
         self.h5_path = Path(h5_path)
 
-        # 只读取一次长度信息
+        # 先从 H5 里面读总长度 + 每帧的 sequence 信息
         with h5py.File(self.h5_path, "r") as f:
             n = f["sbj_shape"].shape[0]
 
+            seq_ids_all = None
+
+            # 优先用 seq_name（字符串），压成整数 id
+            if "seq_name" in f:
+                seq_raw = f["seq_name"][...]        # 形状 (N,)
+                seq_raw = np.asarray(seq_raw)
+                # 直接对字符串/bytes 做 np.unique，得到 per-frame 的整数 id
+                _, seq_ids_all = np.unique(seq_raw, return_inverse=True)
+                seq_ids_all = seq_ids_all.astype(np.int64)
+
+            # 如果 H5 里本身就有 sequence_idx / seq_idx 这样的整型，也顺便兼容
+            elif "sequence_idx" in f:
+                seq_ids_all = np.asarray(f["sequence_idx"][...], dtype=np.int64)
+            elif "seq_idx" in f:
+                seq_ids_all = np.asarray(f["seq_idx"][...], dtype=np.int64)
+            else:
+                # 找不到就置 None，上层会退回“first N frames”的兜底逻辑
+                seq_ids_all = None
+
+        # indices: 当前 split (train / val / test) 的帧索引
         if indices is None:
             self.indices = np.arange(n, dtype=np.int64)
         else:
             self.indices = np.asarray(indices, dtype=np.int64)
+
+        # 对应子集的 sequence id（长度和 self.indices 一致）
+        if seq_ids_all is not None:
+            self.sequence_ids = seq_ids_all[self.indices]
+        else:
+            self.sequence_ids = None  # 兼容旧逻辑，上层会检测到 None
 
         # 延迟打开 H5：真正用到时再 open，一进程一个 file handle
         self._h5 = None

@@ -53,10 +53,16 @@ class TrainConfig:
     limit_val_batches: Optional[int] = None
     loss_t_stamp_threshold: int = 250
 
-    # 新增：H2 形状朝 H1 靠拢的强约束
-    mirror_shape_weight: float = 0.8   # 可以之后调大/调小
+    
+    # Losses
     losses: Dict[str, float] = field(default_factory=lambda: {
-        # 原先的内容不动
+        # has to be commented out, otherwise not overwritten
+        # "denoise_1": 10.0,
+        # "denoise_2": 2.0,
+        # "denoise_3": 5.0,
+        # "smpl_v2v": 25.0,
+        # "obj_v2v": 10.0,
+        # "sbj_contacts": 20.0
     })
 
 
@@ -83,9 +89,9 @@ class SchedulerConfig:
 
 @dataclass
 class LoggingConfig:
-    wandb: bool = False
-    wandb_project: str = 'tridi'
-    wandb_entity: str = ''
+    wandb: bool = True
+    wandb_project: str = 'HH-Gen'
+    wandb_entity: str = 'uv'
 # ============================================================
 
 # ========================= SAMPLE ===========================
@@ -96,7 +102,7 @@ class SampleConfig:
     c: Optional[str] = 'ddpm_guided'
 
     mode: str = "111"  # ('sbj', 'obj', 'contacts')
-    contacts_mode: str = 'clip'  # 'heatmap', 'clip'
+    contacts_mode: str = 'heatmap'  # 'heatmap', 'clip'
 
     num_samples: int = 100
     repetitions: int = 1  # for sampling for the dataset

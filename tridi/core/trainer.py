@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from config.config import ProjectConfig
 from tridi.utils.training import get_optimizer, get_scheduler, TrainState, resume_from_checkpoint, compute_grad_norm
 from tridi.data import get_train_dataloader
-from tridi.data.batch_data import BatchData
+from tridi.data.hh_batch_data import HHBatchData
 from tridi.model.wrappers.mesh import MeshModel
 from tridi.model.wrappers.contact import ContactModel
 from tridi.utils.metrics.reconstruction import get_obj_v2v, get_obj_center_distance, get_mpjpe, get_mpjpe_pa
@@ -36,15 +36,15 @@ class Trainer:
         self.train_state: TrainState = resume_from_checkpoint(cfg, model, optimizer, scheduler)
 
         # Get dataloaders
-        dataloader_train, dataloader_val, canonical_obj_meshes, canonical_obj_keypoints \
-            = get_train_dataloader(cfg)
+        # dataloader_train, dataloader_val, canonical_obj_meshes, canonical_obj_keypoints \
+        #     = get_train_dataloader(cfg)
+        dataloader_train, dataloader_val = get_train_dataloader(cfg)
 
         self.model = model
         self.mesh_model: MeshModel = MeshModel(
             model_path=cfg.env.smpl_folder,
             batch_size=cfg.dataloader.batch_size,
-            canonical_obj_meshes=canonical_obj_meshes,
-            canonical_obj_keypoints=canonical_obj_keypoints,
+
             device=self.model.device
         )
         self.model.set_mesh_model(self.mesh_model)
@@ -53,103 +53,50 @@ class Trainer:
         self.dataloader_train = dataloader_train
         self.dataloader_val = dataloader_val
 
-        # Set contact model
-        contact_model_type = self.cfg.model_conditioning.use_contacts
-        self.contact_model = ContactModel(contact_model_type, device=self.model.device)
-        if contact_model_type == "encoder_decimated_clip":
-            weights_path = Path(cfg.env.assets_folder) / f"{cfg.model_conditioning.contact_model}.pth"
-            self.contacts_enc_dec = "model_enc"
-        elif contact_model_type == "NONE":
-            weights_path = ""
-            self.contacts_enc_dec = ""
-        else:
-            raise ValueError(f"Unsupported contact conditioning {contact_model_type}")
-        self.contact_model.set_contact_model(
-            contact_model_type, self.contacts_enc_dec, weights_path
-        )
-        self.model.set_contact_model(self.contact_model)
 
     def get_outputs(self, batch):
         # get gt sbj vertices and joints
         with torch.no_grad():
-            gt_sbj_vertices, gt_sbj_joints = self.mesh_model.get_smpl_th(batch)
+            # print("Getting batch GT: ", batch)
+            gt_sbj_vertices, gt_sbj_joints, gt_second_sbj_vertices, gt_second_sbj_joints = self.mesh_model.get_smpl_th(batch)
             batch.sbj_vertices = gt_sbj_vertices
             batch.sbj_joints = gt_sbj_joints
-
-            # get gt contacts
-            sbj_contacts, sbj_contacts_full, captions = self.contact_model.encode_contacts(
-                batch.sbj_vertices, batch.sbj_contact_indexes, batch.obj_keypoints,
-                batch.obj_class, batch.obj_R,
-                enc_type=self.contacts_enc_dec, obj_name=batch.obj
-            )
-            batch.sbj_contacts = sbj_contacts
-            batch.sbj_contacts_full = sbj_contacts_full
+            batch.second_sbj_vertices = gt_second_sbj_vertices
+            batch.second_sbj_joints = gt_second_sbj_joints
 
         # aux_output is (x_0, x_t, noise, x_0_pred)
         denoise_loss, aux_output = self.model(batch, 'train', return_intermediate_steps=True)
 
         # aux output is (x_0, x_t, noise, x_0_pred)
+        #print("Aux output[3] shape:", aux_output[3].shape)
         output = self.model.split_output(aux_output[3], aux_output)
-        sbj_vertices, obj_keypoints, sbj_joints = self.mesh_model.get_meshes_wkpts_th(
-            output, batch.obj_class, batch.scale, return_joints=True
+        sbj_vertices, sbj_joints, second_sbj_vertices, second_sbj_joints = self.mesh_model.get_meshes_wkpts_th(
+            output, return_joints=True
         )
         output.sbj_vertices = sbj_vertices
-        output.obj_keypoints = obj_keypoints
         output.sbj_joints = sbj_joints
+        output.second_sbj_vertices = second_sbj_vertices
+        output.second_sbj_joints = second_sbj_joints
 
         return denoise_loss, output
 
-    def compute_loss(self, batch: BatchData, output: TriDiModelOutput, denoise_loss):
+    def compute_loss(self, batch: HHBatchData, output: TriDiModelOutput, denoise_loss):
         wandb_log = dict()
         loss = 0
-        THR = self.cfg.train.loss_t_stamp_threshold
 
         for key, weight in self.cfg.train.losses.items():
             if key == "smpl_v2v":
-                mask = (output.timesteps_sbj <= THR)
-
                 gt_sbj_vertices = batch.sbj_vertices.to(output.sbj_vertices.device)
                 pred_sbj_vertices = output.sbj_vertices
-
-                # filter based on mask
-                gt_sbj_vertices = gt_sbj_vertices[mask]
-                pred_sbj_vertices = pred_sbj_vertices[mask]
-
                 loss_i = F.mse_loss(pred_sbj_vertices, gt_sbj_vertices, reduction='none')
-            elif key == "obj_v2v":
-                mask = (output.timesteps_obj <= THR)
-
-                gt_obj_keypoints = batch.obj_keypoints
-                pred_obj_keypoints = output.obj_keypoints
-
-                # filter based on mask
-                pred_obj_keypoints = pred_obj_keypoints[mask]
-                gt_obj_keypoints = gt_obj_keypoints[mask.cpu()].to(output.obj_keypoints.device)
-
-                loss_i = F.mse_loss(pred_obj_keypoints, gt_obj_keypoints, reduction='none')
-            elif key == "sbj_contacts":
-                mask = torch.logical_and(output.timesteps_sbj <= THR, output.timesteps_sbj <= THR)
-
-                pred_contact_vertices = output.sbj_vertices
-                pred_obj_keypoints = output.obj_keypoints
-
-                # filter based on mask
-                pred_contact_vertices = pred_contact_vertices[mask]
-                pred_obj_keypoints = pred_obj_keypoints[mask]
-
-                sbj_contact_indexes = batch.sbj_contact_indexes[0].to(output.sbj_vertices.device)
-                pred_contact_vertices = pred_contact_vertices[:, sbj_contact_indexes]
-
-                pred_contacts = torch.cdist(
-                    pred_contact_vertices,
-                    pred_obj_keypoints
-                )
-                pred_contacts = pred_contacts.min(dim=-1).values
-                gt_contacts = batch.sbj_contacts_full[mask.cpu()].to(output.sbj_vertices.device)
-                loss_i = F.mse_loss(pred_contacts, gt_contacts, reduction='none')
+            elif key == "second_smpl_v2v":
+                gt_second_sbj_vertices  = batch.second_sbj_vertices.to(output.second_sbj_vertices.device)
+                pred_second_sbj_vertices = output.second_sbj_vertices
+                loss_i = F.mse_loss(pred_second_sbj_vertices, gt_second_sbj_vertices, reduction='none')
             elif key.startswith("denoise"):
                 loss_i = denoise_loss[key]
             else:
+                print("No implementation for ", key)
                 raise NotImplementedError(f"No implementation for {key} loss.")
 
             loss_i = loss_i.mean()
@@ -202,7 +149,6 @@ class Trainer:
         # Log info
         logger.info(
             f'***** Starting training *****\n'
-            f'    Number of classes: {len(self.mesh_model.canonical_obj_keypoints.keys()):_}\n'
             f'    Dataset train size: {len(self.dataloader_train.dataset):_}\n'
             f'    Dataset val size: {len(self.dataloader_val.dataset):_}\n'
             f'    Dataloader train size: {len(self.dataloader_train):_}\n'
@@ -288,19 +234,6 @@ class Trainer:
             )
             tmp_metrics["MPJPE_PA"] += mpjpe_pa
             tmp_counters["MPJPE_PA"] += 1
-        obj_v2v = get_obj_v2v(
-            output.obj_keypoints.detach().cpu().numpy(),
-            batch.obj_keypoints.detach().cpu().numpy()
-        )
-        tmp_metrics["OBJ_V2V"] += np.sum(obj_v2v)
-        tmp_counters["OBJ_V2V"] += len(obj_v2v)
-        obj_center_distance = get_obj_center_distance(
-            output.obj_keypoints.detach().cpu().numpy(),
-            batch.obj_keypoints.detach().cpu().numpy()
-        )
-        tmp_metrics["OBJ_CENTER_DISTANCE"] += np.sum(obj_center_distance)
-        tmp_counters["OBJ_CENTER_DISTANCE"] += len(obj_center_distance)
-
         return tmp_metrics, tmp_counters
 
     @torch.no_grad()

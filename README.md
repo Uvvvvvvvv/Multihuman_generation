@@ -58,26 +58,18 @@ three numbers correspond to human, object, and interaction, respectively;
 `1` means the modality is sampled, `0` means it is conditioned on. 
 For example, `sample.mode="sample_101"` means sampling human and interaction conditioned on the object.
 ```bash
-python main.py -c config/env.yaml scenarios/gb_main.yaml -- \
-  run.job=sample run.name=001_gb_main sample.target=hdf5 \
-  resume.checkpoint="./assets/gb_main.pth" \
-  dataloader.batch_size=1024 sample.mode="sample_101" \
-  run.datasets=["grab","behave"] sample.dataset=normal sample.repetitions=3 \
-  model.cg_apply=True model.cg_scale=2.0
+python sampler.py
 ```
 Use the command below to run evaluation on the generated samples. The `eval.sampling_target` parameter controls 
 which modalities are evaluated (possible values: `sbj_contact`, `obj_contact`,):
 ```bash
-python main.py -c config/env.yaml scenarios/gb_main.yaml -- \
-  run.job=eval run.name=001_gb_main resume.step=-1 \
-  eval.sampling_target=['sbj_contact'] 
+python eval_h2h_metrics.py
 ```
 
 ## Training
 Use the following command to run the training:
 ```bash
-python main.py -c config/env.yaml scenarios/gb_main.yaml -- \
-  run.name=001_gb_main run.job=train
+python trainer.py
 ```
 
 

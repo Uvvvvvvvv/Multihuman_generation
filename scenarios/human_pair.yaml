@@ -1,5 +1,5 @@
 run:
-  name: humanpair_10frame_perseq
+  name: humanpair_100frame_perseq
   job: train
   datasets:
     - human_pair

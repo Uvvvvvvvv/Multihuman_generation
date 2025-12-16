@@ -1,4 +1,6 @@
 # eval_h2h_metrics.py
+import os
+import sys
 import math
 import inspect
 from pathlib import Path
@@ -13,6 +15,20 @@ import wandb
 
 from torch.utils.data import DataLoader, Subset
 
+# ---------------------------
+# ✅ 让脚本从任何位置运行都能 import 到 repo
+# ---------------------------
+def _find_repo_root(start: Path) -> Path:
+    start = start.resolve()
+    for p in [start] + list(start.parents):
+        if (p / "tridi").is_dir() and (p / "config").is_dir():
+            return p
+    return start.parent
+
+_REPO_ROOT = _find_repo_root(Path(__file__).resolve())
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from tridi.data import get_train_dataloader
 from train_h2h import load_config, build_model, build_smplx_layer
 
@@ -20,44 +36,61 @@ from train_h2h import load_config, build_model, build_smplx_layer
 # ============================================================
 # 你可以改的参数
 # ============================================================
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_overfit2frames/step_242500.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_10frame_perseq/step_105000.pt"
+# python eval_h2h_metrics.py
 START_STEP = 2500
-END_STEP = 242500
+END_STEP = 105000
 STEP_STRIDE = 2500
 
 # ---- eval subset 选择策略（优先级：manual > randomK > firstN）----
-# A) 手动指定 indices（默认关闭）
 USE_FRAME_INDICES_FOR_EVAL = False
-FRAME_INDICES = None  # 例如 [0, 1, 10]
+FRAME_INDICES = None
 
-# B) 从整个 val/train 随机抽 K 帧（你要的就是这个）
-EVAL_RANDOM_K_TRAIN = None   # 例如 512；不想抽就 None
-EVAL_RANDOM_K_VAL   = 256    # ✅ 从全量 val 抽 K 帧
-EVAL_RANDOM_SEED    = 42     # 固定 seed，保证 sweep 可比
-
-# C) 前 N 帧（默认关闭）
+EVAL_RANDOM_K_TRAIN = None
+EVAL_RANDOM_K_VAL   = 256
+EVAL_RANDOM_SEED    = 42
 EVAL_FIRST_N_TRAIN = None
 EVAL_FIRST_N_VAL   = None
-
-# eval 时建议不要 shuffle（保证稳定）
 EVAL_SUBSET_SHUFFLE = False
 
-# ---- 选 best ckpt 规则 ----
-TOPK_PRIMARY = 5  # 先按 val/MPJPE_PA_mean 取前 K，再按 secondary 打破平手
+TOPK_PRIMARY = 5
 
 
 # ============================================================
-# 【可选】Multi-sample eval：对每个 frame 采样 K 次 H2|H1，然后 mean/best 聚合
+# Multi-sample eval
 # ============================================================
 USE_MULTI_SAMPLE_EVAL = True
-MULTI_SAMPLE_SPLITS = {"val"}         # 你可以设成 {"train","val"} 或只 {"val"}
-MULTI_SAMPLE_K = 10                   # 每个 frame 采样次数
+MULTI_SAMPLE_SPLITS = {"val"}
+MULTI_SAMPLE_K = 10
 MULTI_SAMPLE_SELECT = "mean"          # "mean" 或 "best"
-BEST_SELECT_BY = "MPJPE_PA_H2"        # best-of-K 用哪个指标选最好： "MPJPE_H2" or "MPJPE_PA_H2"
-SAMPLE_NUM_STEPS = 250                # 反向扩散步数
+BEST_SELECT_BY = "MPJPE_PA_H2"
+SAMPLE_NUM_STEPS = 250
 SAMPLE_SCHEDULER_NAME = "ddpm"
-TORCH_SAMPLE_SEED = 1234              # 想每次都不一样就设成 None
+TORCH_SAMPLE_SEED = 1234
 OVERRIDE_H2_METRICS_WITH_SAMPLING = True
+
+
+# ============================================================
+# ✅ 运行时禁用 faces（防止你那个 sbj_f 是常量 faces 表却被按 idx 取导致越界）
+#    评估指标不需要 faces，所以直接关掉最稳
+# ============================================================
+def _disable_faces_keys_in_dataset(ds):
+    # 递归下钻：Subset / ConcatDataset / wrapper
+    if hasattr(ds, "dataset"):
+        _disable_faces_keys_in_dataset(ds.dataset)
+    if hasattr(ds, "datasets"):
+        for sub in ds.datasets:
+            _disable_faces_keys_in_dataset(sub)
+
+    # 真实 dataset：尝试找到 keymap
+    for km_attr in ["km", "key_map", "keymap", "keys_map"]:
+        if hasattr(ds, km_attr):
+            km = getattr(ds, km_attr)
+            if hasattr(km, "sbj_f"):
+                setattr(km, "sbj_f", None)
+            if hasattr(km, "second_sbj_f"):
+                setattr(km, "second_sbj_f", None)
+            return
 
 
 # ============================================================
@@ -211,7 +244,7 @@ def make_indices_loader(loader: DataLoader, indices, shuffle: bool = False):
     kwargs = dict(
         batch_size=loader.batch_size,
         shuffle=shuffle,
-        num_workers=loader.num_workers,
+        num_workers=loader.num_workers,   # ✅ 不强制改成 0
         collate_fn=getattr(loader, "collate_fn", None),
         drop_last=False,
         pin_memory=getattr(loader, "pin_memory", False),
@@ -229,9 +262,6 @@ def make_indices_loader(loader: DataLoader, indices, shuffle: bool = False):
     return new_loader, valid, invalid, n_ds
 
 
-# ============================================================
-# ✅ 新增：随机抽 K 帧（不放回）
-# ============================================================
 def make_random_k_loader(loader: DataLoader, k: int, seed: int, shuffle: bool = False):
     ds = loader.dataset
     n = len(ds)
@@ -271,7 +301,7 @@ def add_derived_metrics(m: dict) -> dict:
 
 
 # ============================================================
-# 下面这些 sampling 部分保持你之前那份逻辑
+# sampling 部分（保持你原逻辑）
 # ============================================================
 def _get_scheduler_from_model(model, name: str):
     if hasattr(model, "schedulers_map") and isinstance(model.schedulers_map, dict) and name in model.schedulers_map:
@@ -420,7 +450,7 @@ def sample_h2_given_h1_batch_ddpm_x0(
 
         all_h2.append(x_h2)
 
-    samples_h2 = torch.stack(all_h2, dim=1)
+    samples_h2 = torch.stack(all_h2, dim=1)  # (B,K,D_obj)
     return samples_h2
 
 
@@ -462,15 +492,39 @@ def compute_metrics_for_split(model, loader, smpl_layer, num_betas_model: int, d
         B = sbj_vec.shape[0]
         n_samples += B
 
-        out_sbj_gt = smpl_outputs_from_params_batch(sbj_vec,     smpl_layer, num_betas_model)
-        out_obj_gt = smpl_outputs_from_params_batch(obj_vec,     smpl_layer, num_betas_model)
+        # ---------------------------
+        # ✅ GT joints：优先用 H5 里的 sbj_j / second_sbj_j（如果 batch 有）
+        #    GT vertices：如果 batch 没有，就用 GT params 跑 SMPL-X（用于 V2V）
+        # ---------------------------
+        use_h5_joints = ("sbj_j" in batch) and ("second_sbj_j" in batch)
+
+        # pred 一定要 SMPL
         out_sbj_pd = smpl_outputs_from_params_batch(x0_pred_sbj, smpl_layer, num_betas_model)
         out_obj_pd = smpl_outputs_from_params_batch(x0_pred_obj, smpl_layer, num_betas_model)
 
-        v_sbj_gt, v_sbj_pd = out_sbj_gt.vertices, out_sbj_pd.vertices
-        v_obj_gt, v_obj_pd = out_obj_gt.vertices, out_obj_pd.vertices
-        j_sbj_gt, j_sbj_pd = out_sbj_gt.joints,   out_sbj_pd.joints
-        j_obj_gt, j_obj_pd = out_obj_gt.joints,   out_obj_pd.joints
+        v_sbj_pd = out_sbj_pd.vertices
+        v_obj_pd = out_obj_pd.vertices
+        j_sbj_pd = out_sbj_pd.joints
+        j_obj_pd = out_obj_pd.joints
+
+        if use_h5_joints:
+            j_sbj_gt = batch["sbj_j"].to(device).float()
+            j_obj_gt = batch["second_sbj_j"].to(device).float()
+        else:
+            out_sbj_gt = smpl_outputs_from_params_batch(sbj_vec, smpl_layer, num_betas_model)
+            out_obj_gt = smpl_outputs_from_params_batch(obj_vec, smpl_layer, num_betas_model)
+            j_sbj_gt = out_sbj_gt.joints
+            j_obj_gt = out_obj_gt.joints
+
+        # V2V 需要 GT vertices：如果没存，就跑 GT params
+        if ("sbj_v" in batch) and ("second_sbj_v" in batch):
+            v_sbj_gt = batch["sbj_v"].to(device).float()
+            v_obj_gt = batch["second_sbj_v"].to(device).float()
+        else:
+            out_sbj_gt_v = smpl_outputs_from_params_batch(sbj_vec, smpl_layer, num_betas_model)
+            out_obj_gt_v = smpl_outputs_from_params_batch(obj_vec, smpl_layer, num_betas_model)
+            v_sbj_gt = out_sbj_gt_v.vertices
+            v_obj_gt = out_obj_gt_v.vertices
 
         # H1 recon
         J1_gt = j_sbj_gt[:, :22, :]
@@ -531,7 +585,6 @@ def compute_metrics_for_split(model, loader, smpl_layer, num_betas_model: int, d
 
             v2v_h2_all = torch.mean(torch.abs(v_obj_s - v_obj_gt[:, None, :, :]), dim=(2, 3))  # (B,K)
 
-            # pelvis for conditional generation: H1 pelvis GT, H2 pelvis from sample
             P2_s = J2_s[:, :, 0, :]            # (B,K,3)
             rel_pd = P2_s - P1_gt[:, None, :]  # (B,K,3)
             rel_gt_k = rel_gt[:, None, :]
@@ -627,7 +680,7 @@ def pretty_print_metrics(prefix: str, m: dict):
 # 主程序
 # ============================================================
 def main():
-    ckpt_root = Path(CKPT_PATH).parent
+    ckpt_root = Path(CKPT_PATH).resolve().parent
 
     cfg = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -639,35 +692,35 @@ def main():
     else:
         train_loader = val_loader = dl_ret
 
+    # ✅ 关掉 faces key（避免你那个常量 faces 表 idx 越界）
+    _disable_faces_keys_in_dataset(train_loader.dataset)
+    _disable_faces_keys_in_dataset(val_loader.dataset)
+
     # ============================================================
     # ✅ 选择 eval 子集（优先级：manual > randomK > firstN）
     # ============================================================
     if USE_FRAME_INDICES_FOR_EVAL and FRAME_INDICES is not None:
-        train_loader, train_valid, train_invalid, train_len = make_indices_loader(
+        train_loader, train_valid, _, train_len = make_indices_loader(
             train_loader, FRAME_INDICES, shuffle=EVAL_SUBSET_SHUFFLE
         )
-        val_loader, val_valid, val_invalid, val_len = make_indices_loader(
+        val_loader, val_valid, _, val_len = make_indices_loader(
             val_loader, FRAME_INDICES, shuffle=EVAL_SUBSET_SHUFFLE
         )
-        print(f"[EvalSubset-MANUAL] train dataset_len={train_len}, use {len(train_valid)} indices. seed=NA")
-        print(f"                  train valid[0:10]={train_valid[:10]}")
-        print(f"[EvalSubset-MANUAL] val   dataset_len={val_len}, use {len(val_valid)} indices. seed=NA")
-        print(f"                  val   valid[0:10]={val_valid[:10]}")
+        print(f"[EvalSubset-MANUAL] train dataset_len={train_len}, use {len(train_valid)} indices.")
+        print(f"[EvalSubset-MANUAL] val   dataset_len={val_len}, use {len(val_valid)} indices.")
 
     elif (EVAL_RANDOM_K_TRAIN is not None) or (EVAL_RANDOM_K_VAL is not None):
         if EVAL_RANDOM_K_TRAIN is not None:
-            train_loader, train_valid, train_invalid, train_len = make_random_k_loader(
+            train_loader, train_valid, _, train_len = make_random_k_loader(
                 train_loader, EVAL_RANDOM_K_TRAIN, seed=EVAL_RANDOM_SEED + 123, shuffle=EVAL_SUBSET_SHUFFLE
             )
             print(f"[EvalSubset-RANDOMK] train dataset_len={train_len}, sample K={len(train_valid)} seed={EVAL_RANDOM_SEED + 123}")
-            print(f"                    train valid[0:10]={train_valid[:10]}")
 
         if EVAL_RANDOM_K_VAL is not None:
-            val_loader, val_valid, val_invalid, val_len = make_random_k_loader(
+            val_loader, val_valid, _, val_len = make_random_k_loader(
                 val_loader, EVAL_RANDOM_K_VAL, seed=EVAL_RANDOM_SEED, shuffle=EVAL_SUBSET_SHUFFLE
             )
             print(f"[EvalSubset-RANDOMK] val   dataset_len={val_len}, sample K={len(val_valid)} seed={EVAL_RANDOM_SEED}")
-            print(f"                    val   valid[0:10]={val_valid[:10]}")
 
     elif (EVAL_FIRST_N_TRAIN is not None) or (EVAL_FIRST_N_VAL is not None):
         if EVAL_FIRST_N_TRAIN is not None:
@@ -698,14 +751,10 @@ def main():
         run_name = f"{cfg.run.name}_eval_randomK_val"
         wandb.init(project=project, name=run_name, config=OmegaConf.to_container(cfg, resolve=True))
         wandb.config.update({
-            "USE_FRAME_INDICES_FOR_EVAL": USE_FRAME_INDICES_FOR_EVAL,
-            "FRAME_INDICES": FRAME_INDICES,
             "EVAL_RANDOM_K_TRAIN": EVAL_RANDOM_K_TRAIN,
             "EVAL_RANDOM_K_VAL": EVAL_RANDOM_K_VAL,
             "EVAL_RANDOM_SEED": EVAL_RANDOM_SEED,
             "TOPK_PRIMARY": TOPK_PRIMARY,
-            "PRIMARY": "val/MPJPE_PA_mean",
-            "SECONDARY": "val/PelvDist + 0.5*val/V2V_mean",
             "USE_MULTI_SAMPLE_EVAL": USE_MULTI_SAMPLE_EVAL,
             "MULTI_SAMPLE_SPLITS": list(MULTI_SAMPLE_SPLITS),
             "MULTI_SAMPLE_K": MULTI_SAMPLE_K,
@@ -714,6 +763,7 @@ def main():
             "SAMPLE_NUM_STEPS": SAMPLE_NUM_STEPS,
             "SAMPLE_SCHEDULER_NAME": SAMPLE_SCHEDULER_NAME,
             "OVERRIDE_H2_METRICS_WITH_SAMPLING": OVERRIDE_H2_METRICS_WITH_SAMPLING,
+            "DISABLE_FACES_KEYS": True,
         }, allow_val_change=True)
 
     # 4) eval sweep
@@ -753,7 +803,6 @@ def main():
                 log_dict[f"val/{k}"] = float(v)
             wandb.log(log_dict, step=step)
 
-    # 5) select best ckpt
     if len(all_rows) == 0:
         print("\n[ERROR] No checkpoints evaluated (all missing?).")
         if use_wandb:
@@ -792,8 +841,6 @@ def main():
         wandb.run.summary["best/ckpt_path"] = best_path
         wandb.run.summary["best/val_MPJPE_PA_mean"] = float(best["val"]["MPJPE_PA_mean"])
         wandb.run.summary["best/val_secondary_score"] = float(best["val"]["secondary_score"])
-        wandb.run.summary["best/val_PelvDist"] = float(best["val"]["PelvDist"])
-        wandb.run.summary["best/val_V2V_mean"] = float(best["val"]["V2V_mean"])
         wandb.finish()
 
 

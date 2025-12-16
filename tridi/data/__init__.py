@@ -78,7 +78,7 @@ def get_train_dataloader(cfg: ProjectConfig):
 
             # env.datasets_folder 指向 raw 根目录：.../embody-3d/datasets
             raw_root = Path(cfg.env.datasets_folder)
-            h5_path = raw_root.parent / "embody3d_h2h_10frames_per_seq.h5"
+            h5_path = raw_root.parent / "embody3d_h2h_100frames_per_seq.h5"
 
             # 只在主进程这里做一次 split
             train_idx, val_idx, test_idx = _build_sequence_split(h5_path)

@@ -16,7 +16,7 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_eachsequence_1frame/step_050000.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_eachsequence_1frame/step_500000.pt"
 #python sample_h2h_conditional.py
 
 

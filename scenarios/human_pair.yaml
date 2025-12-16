@@ -1,12 +1,12 @@
 run:
-  name: humanpair_overfit10frames
+  name: humanpair_10frame_perseq
   job: train
   datasets:
     - human_pair
 
 dataloader:
-  batch_size: 10
-  workers: 10
+  batch_size: 2048
+  workers: 12
   sampler: default
 
 model_denoising:

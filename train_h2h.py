@@ -24,8 +24,8 @@ from tridi.model.tridi import TriDiModel
 # ============================================================
 # 手动设置：是否从某个 step 继续训练
 # ============================================================
-RESUME_STEP = 230000         # 如果想从中间接着训练，改成已有 ckpt 的 step
-USE_RESUME = False         # True 表示从 RESUME_STEP 对应的 ckpt 恢复
+RESUME_STEP = 115000         # 如果想从中间接着训练，改成已有 ckpt 的 step
+USE_RESUME = False        # True 表示从 RESUME_STEP 对应的 ckpt 恢复
 # python train_h2h.py
 
 # ============================================================
@@ -39,7 +39,7 @@ V2V_EVERY_N_STEPS = 1   # 每多少个 step 计算一次 v2v（1 = 每步都算�
 LOSS_T_THR = 250
 
 # 小数据 overfit 模式：只用很少几帧做 train/val（比如 Embody3D 的 几 帧）
-OVERFIT_TINY_SUBSET = True
+OVERFIT_TINY_SUBSET = False
 TINY_NUM_FRAMES_TRAIN = 10
 TINY_NUM_FRAMES_VAL = 10
 # 手动指定用哪些 frame index 来 overfit（相对于 train_loader.dataset）

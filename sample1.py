@@ -15,7 +15,7 @@ from tridi.data.embody3d_h2h_dataset import Embody3DH2HDataset
 from config.config import DenoisingModelConfig, ConditioningModelConfig
 
 # ========= 你可以改的参数 =========
-CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_overfit10frames/step_010000.pt"
+CKPT_PATH = "/media/uv/Data/workspace/tridi/experiments/humanpair_eachsequence_1frame/step_500000.pt"
 #python sample1.py
 # 如果为 None，就用 ckpt 里的 cfg.env.datasets_folder
 DATASET_ROOT = None
@@ -31,7 +31,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 你 overfit 用的那 10 帧
-FRAME_INDICES = [1,1000,9999,66666,123456,654321,666666,999999,1234567,2345678] 
+FRAME_INDICES = [1,798375,3,4] 
 
 # 每个条件帧，从纯噪声采多少个 sample
 SAMPLES_PER_FRAME = 2

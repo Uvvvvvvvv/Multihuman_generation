@@ -320,32 +320,24 @@ def canonicalize_pair(h1: dict, h2: dict, verts: np.ndarray, joints: np.ndarray)
     R_total = R_GRAB.copy()  # (3,3)
 
     if ALIGN_WITH_JOINTS:
-        # 用 H1 joints 做 torso 方向
-        j0 = joints[0]  # (J,3)
+        j0 = joints[0]
         j_center = j0 - rot_center[None, :]
-        j_grab = (R_GRAB @ j_center.T).T  # (J,3)
+        j_grab = (R_GRAB @ j_center.T).T
 
-        # BEHAVE 里用 joints[2]-joints[1] 作为“肩/髋方向”（我沿用）
-        v = (j_grab[2] - j_grab[1]).astype(np.float32)
-        if v.shape[-1] != 3:
-            v = v.reshape(-1)[:3]  # 极端情况下防炸
-        if np.linalg.norm(v) < 1e-8:
-            R_align = np.eye(3, dtype=np.float32)
+        v = (j_grab[2] - j_grab[1]).astype(np.float32)   # 你的 torso/肩髋方向
+        v_xy = v.copy()
+        v_xy[2] = 0.0
+        n = float(np.linalg.norm(v_xy))
+
+        if n < 1e-6:
+            R_align = np.eye(3, dtype=np.float32)  # 退化：不对齐
         else:
-            z = np.array([0, 0, 1], dtype=np.float32)
-            dir_xy = np.cross(z, v).astype(np.float32)
-            dir_xy[2] = 0.0
-            n = float(np.linalg.norm(dir_xy) + 1e-8)
-            dir_xy = dir_xy / n
-
-        # align [1,0,0] -> dir_xy
-        try:
-            R_align, _ = Rotation.align_vectors(np.array([[1, 0, 0]], dtype=np.float32), dir_xy[None])
-            R_align = R_align.as_matrix().astype(np.float32)
-        except Exception:
-            R_align = np.eye(3, dtype=np.float32)
+            v_xy /= n
+            yaw = float(np.arctan2(v_xy[1], v_xy[0]))  # 让 x 轴对齐到 v_xy
+            R_align = Rotation.from_euler("z", yaw, degrees=False).as_matrix().astype(np.float32)
 
         R_total = (R_align @ R_GRAB).astype(np.float32)
+
 
     # 先把 verts/joints 旋转 + 平移到 canonical（暂不做 ground）
     v_center = verts - rot_center[None, None, :]

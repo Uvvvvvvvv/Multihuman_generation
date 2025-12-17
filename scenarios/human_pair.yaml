@@ -5,7 +5,7 @@ run:
     - human_pair
 
 dataloader:
-  batch_size: 3072
+  batch_size: 2048
   workers: 12
   sampler: default
 
